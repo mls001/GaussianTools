@@ -490,7 +490,7 @@ def parse_td_data(log_path):
 class GaussianToolGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("mls V0.0.2")
+        self.title("mls V0.0.3")
         self.geometry("850x700")
         self.resizable(True, True)
         atexit.register(self.cleanup_all_temp)
@@ -509,9 +509,20 @@ class GaussianToolGUI(tk.Tk):
         mode_frame.pack(fill=tk.X, padx=5, pady=5)
         icon_path = resource_path("md.ico")
         try:
-            self.iconbitmap(icon_path)  # 仅 Windows 支持 .ico
+            # 方法1：iconbitmap（传统）
+            self.iconbitmap(icon_path)
+        except:
+            pass
+        try:
+            # 方法2：iconphoto（更现代，支持 PNG/ICO）
+            from PIL import Image, ImageTk
+            img = Image.open(icon_path)
+            img = img.resize((32, 32), Image.Resampling.LANCZOS)
+            icon_img = ImageTk.PhotoImage(img)
+            self.iconphoto(True, icon_img)
+            self._icon_img = icon_img  # 防止被垃圾回收
         except Exception as e:
-            print(f"图标加载失败: {e}")
+            print(f"设置图标失败: {e}")
         self.mode_var = tk.StringVar(value="modify_gjf")
         modes = [
             ("修改 GJF 参数", "modify_gjf"),
@@ -558,8 +569,8 @@ class GaussianToolGUI(tk.Tk):
         self.config_file = os.path.join(os.path.expanduser("~"), ".gaussian_tool_config.ini")
 
         self.on_mode_change()
-        # 在右上角显示头像
-        self.avatar_label = ttk.Label(self, text="🐧", font=("", 16))
+        # 在右上角显示头像（使用 tk.Label 以支持边框）
+        self.avatar_label = tk.Label(self, text="🐧", font=("", 16), relief="solid", borderwidth=3)
         self.avatar_label.place(relx=1.0, x=-10, y=10, anchor="ne")
         self.avatar_label.bind("<Button-1>", lambda e: self.set_avatar())
 
@@ -608,7 +619,7 @@ class GaussianToolGUI(tk.Tk):
         """更新显示的头像"""
         try:
             img = Image.open(image_path)
-            img.thumbnail((32, 32), Image.Resampling.LANCZOS)
+            img.thumbnail((64, 64), Image.Resampling.LANCZOS)
             self.avatar_img = ImageTk.PhotoImage(img)
             self.avatar_label.config(image=self.avatar_img, text="")
         except:
