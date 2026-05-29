@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+import posixpath
 import sys
 import os
 import re
@@ -10,6 +11,14 @@ from tkinter import ttk, filedialog, scrolledtext
 from PIL import Image, ImageTk
 from openpyxl import Workbook
 import winsound
+import urllib.parse
+import paramiko
+import tempfile
+import shutil
+import urllib.parse
+import configparser
+from pathlib import Path
+import atexit
 # ----------------------------------------------------------------------
 # 公用函数
 # ----------------------------------------------------------------------
@@ -484,9 +493,20 @@ class GaussianToolGUI(tk.Tk):
         self.title("mls V0.0.2")
         self.geometry("850x700")
         self.resizable(True, True)
+        atexit.register(self.cleanup_all_temp)
+        # 添加菜单栏
+        menubar = tk.Menu(self)
+        self.config(menu=menubar)
+
+        # 远程服务器菜单
+        remote_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="远程服务器", menu=remote_menu)
+        remote_menu.add_command(label="连接/断开", command=self.manage_remote_connection)
+        remote_menu.add_separator()
+        remote_menu.add_command(label="设置登录头像", command=self.set_avatar)
+
         mode_frame = ttk.LabelFrame(self, text="操作模式", padding=5)
         mode_frame.pack(fill=tk.X, padx=5, pady=5)
-        # 在 __init__ 方法中，创建窗口后
         icon_path = resource_path("md.ico")
         try:
             self.iconbitmap(icon_path)  # 仅 Windows 支持 .ico
@@ -503,6 +523,8 @@ class GaussianToolGUI(tk.Tk):
         for text, value in modes:
             ttk.Radiobutton(mode_frame, text=text, variable=self.mode_var,
                             value=value, command=self.on_mode_change).pack(side=tk.LEFT, padx=10)
+
+
 
         self.param_frame = None
         log_frame = ttk.LabelFrame(self, text="运行日志", padding=5)
@@ -523,7 +545,82 @@ class GaussianToolGUI(tk.Tk):
         self.add_logo(btn_frame)
 
         self.current_widgets = []
+        # 远程连接相关
+        self.ssh_client = None
+        self.sftp = None
+        self.remote_host = ""
+        self.remote_user = ""
+        self.remote_port = 22
+        self.remote_password = ""
+        self.remote_key_file = ""
+        self.auth_method = "password"  # 'password' or 'key'
+        # 配置文件路径（保存头像和SSH信息）
+        self.config_file = os.path.join(os.path.expanduser("~"), ".gaussian_tool_config.ini")
+
         self.on_mode_change()
+        # 在右上角显示头像
+        self.avatar_label = ttk.Label(self, text="🐧", font=("", 16))
+        self.avatar_label.place(relx=1.0, x=-10, y=10, anchor="ne")
+        self.avatar_label.bind("<Button-1>", lambda e: self.set_avatar())
+
+        self.load_config()
+
+    def load_config(self):
+        """加载配置文件（头像路径、SSH连接信息）"""
+        config = configparser.ConfigParser()
+        if os.path.exists(self.config_file):
+            config.read(self.config_file)
+            # 加载头像
+            if 'Avatar' in config and 'path' in config['Avatar']:
+                avatar_path = config['Avatar']['path']
+                if os.path.exists(avatar_path):
+                    self.update_avatar_display(avatar_path)
+            # 加载SSH连接信息（可选）
+            if 'SSH' in config:
+                self.remote_host = config['SSH'].get('host', '')
+                self.remote_user = config['SSH'].get('user', '')
+                self.remote_port = config['SSH'].getint('port', 22)
+                self.auth_method = config['SSH'].get('auth_method', 'password')
+                if self.auth_method == 'password':
+                    self.remote_password = config['SSH'].get('password', '')
+                else:
+                    self.remote_key_file = config['SSH'].get('key_file', '')
+
+    def save_config(self):
+        """保存配置文件"""
+        config = configparser.ConfigParser()
+        # 保存头像路径
+        if hasattr(self, 'avatar_image_path') and self.avatar_image_path:
+            config['Avatar'] = {'path': self.avatar_image_path}
+        # 保存SSH信息
+        config['SSH'] = {
+            'host': self.remote_host,
+            'user': self.remote_user,
+            'port': str(self.remote_port),
+            'auth_method': self.auth_method,
+            'password': self.remote_password if self.auth_method == 'password' else '',
+            'key_file': self.remote_key_file if self.auth_method == 'key' else ''
+        }
+        with open(self.config_file, 'w') as f:
+            config.write(f)
+
+    def update_avatar_display(self, image_path):
+        """更新显示的头像"""
+        try:
+            img = Image.open(image_path)
+            img.thumbnail((32, 32), Image.Resampling.LANCZOS)
+            self.avatar_img = ImageTk.PhotoImage(img)
+            self.avatar_label.config(image=self.avatar_img, text="")
+        except:
+            self.avatar_label.config(text="🐧", image="")
+
+    def set_avatar(self):
+        """选择登录头像图片"""
+        file_path = filedialog.askopenfilename(filetypes=[("Image files", "*.png *.jpg *.jpeg *.gif *.bmp")])
+        if file_path:
+            self.avatar_image_path = file_path
+            self.update_avatar_display(file_path)
+            self.save_config()
 
     def add_logo(self, parent_frame):
         # 使用 resource_path 获取图片路径（兼容打包）
@@ -573,6 +670,423 @@ class GaussianToolGUI(tk.Tk):
         else:
             self.create_extract_scan_widgets()
 
+# ----------------------------------------------------------------------
+# 远程相关
+# ----------------------------------------------------------------------
+    def manage_remote_connection(self):
+        """弹出远程连接管理对话框"""
+        dialog = tk.Toplevel(self)
+        dialog.title("远程服务器连接")
+        dialog.geometry("500x300")
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.grab_set()
+        try:
+            icon_path = resource_path("md.ico")
+            dialog.iconbitmap(icon_path)
+        except Exception:
+            pass
+        # 变量
+        host_var = tk.StringVar(value=self.remote_host)
+        port_var = tk.StringVar(value=str(self.remote_port))
+        user_var = tk.StringVar(value=self.remote_user)
+        auth_var = tk.StringVar(value=self.auth_method)
+        password_var = tk.StringVar(value=self.remote_password)
+        key_var = tk.StringVar(value=self.remote_key_file)
+
+        row = 0
+        ttk.Label(dialog, text="主机:").grid(row=row, column=0, sticky=tk.W, padx=5, pady=2)
+        ttk.Entry(dialog, textvariable=host_var, width=30).grid(row=row, column=1, padx=5, pady=2)
+        ttk.Label(dialog, text="端口:").grid(row=row, column=2, sticky=tk.W, padx=5)
+        ttk.Entry(dialog, textvariable=port_var, width=8).grid(row=row, column=3, padx=5)
+        row += 1
+
+        ttk.Label(dialog, text="用户名:").grid(row=row, column=0, sticky=tk.W, padx=5, pady=2)
+        ttk.Entry(dialog, textvariable=user_var, width=30).grid(row=row, column=1, padx=5, pady=2)
+        row += 1
+
+        ttk.Radiobutton(dialog, text="密码认证", variable=auth_var, value="password").grid(row=row, column=0,
+                                                                                           sticky=tk.W, padx=5)
+        ttk.Radiobutton(dialog, text="密钥认证", variable=auth_var, value="key").grid(row=row, column=1, sticky=tk.W,
+                                                                                      padx=5)
+        row += 1
+
+        # 密码/密钥输入框
+        pass_frame = ttk.Frame(dialog)
+        pass_frame.grid(row=row, column=0, columnspan=4, sticky=tk.W, padx=5, pady=2)
+        ttk.Label(pass_frame, text="密码/密钥路径:").pack(side=tk.LEFT)
+        pass_entry = ttk.Entry(pass_frame, textvariable=password_var if auth_var.get() == "password" else key_var,
+                               width=40)
+        pass_entry.pack(side=tk.LEFT, padx=5)
+
+        def update_auth_input(*args):
+            pass_entry.config(textvariable=password_var if auth_var.get() == "password" else key_var)
+
+        auth_var.trace_add('write', update_auth_input)
+        update_auth_input()
+        row += 1
+
+        # 状态标签
+        status_label = ttk.Label(dialog, text="", foreground="blue")
+        status_label.grid(row=row, column=0, columnspan=4, pady=5)
+
+        def do_connect():
+            try:
+                client = paramiko.SSHClient()
+                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                host = host_var.get().strip()
+                port = int(port_var.get().strip())
+                user = user_var.get().strip()
+                if auth_var.get() == "password":
+                    pwd = password_var.get()
+                    client.connect(hostname=host, port=port, username=user, password=pwd, timeout=10)
+                else:
+                    key_path = os.path.expanduser(key_var.get())
+                    key = paramiko.RSAKey.from_private_key_file(key_path)
+                    client.connect(hostname=host, port=port, username=user, pkey=key, timeout=10)
+                # 成功
+                self.ssh_client = client
+                self.sftp = self.ssh_client.open_sftp()
+                self.remote_host = host
+                self.remote_port = port
+                self.remote_user = user
+                self.auth_method = auth_var.get()
+                if self.auth_method == "password":
+                    self.remote_password = password_var.get()
+                else:
+                    self.remote_key_file = key_var.get()
+                self.save_config()
+                status_label.config(text="连接成功", foreground="green")
+                dialog.after(2000, dialog.destroy)
+            except Exception as e:
+                status_label.config(text=f"连接失败: {e}", foreground="red")
+
+        ttk.Button(dialog, text="连接", command=do_connect).grid(row=row + 1, column=0, columnspan=4, pady=10)
+
+    def disconnect_remote(self):
+        if self.sftp:
+            self.sftp.close()
+        if self.ssh_client:
+            self.ssh_client.close()
+        self.ssh_client = None
+        self.sftp = None
+        self.log("已断开远程连接")
+
+    def select_remote_folder(self, target_var):
+        if not self.sftp:
+            self.log("请先连接远程服务器")
+            return
+        dialog = tk.Toplevel(self)
+        dialog.title("选择远程路径（目录或文件）")
+        dialog.geometry("700x500")
+        dialog.transient(self)
+        dialog.grab_set()
+
+        try:
+            icon_path = resource_path("md.ico")
+            dialog.iconbitmap(icon_path)
+        except Exception:
+            pass
+
+        default_path = f"/home/{self.remote_user}"
+        try:
+            self.sftp.stat(default_path)
+        except FileNotFoundError:
+            default_path = "/"
+        current_path = tk.StringVar(value=default_path)
+
+        path_frame = ttk.Frame(dialog)
+        path_frame.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Label(path_frame, text="路径:").pack(side=tk.LEFT)
+        path_entry = ttk.Entry(path_frame, textvariable=current_path)
+        path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Button(path_frame, text="刷新", command=lambda: refresh_tree()).pack(side=tk.LEFT)
+        ttk.Button(path_frame, text="上级", command=lambda: go_parent()).pack(side=tk.LEFT)
+        ttk.Button(path_frame, text="新建文件夹", command=lambda: new_folder()).pack(side=tk.LEFT, padx=5)
+        ttk.Button(path_frame, text="删除", command=lambda: delete_selected()).pack(side=tk.LEFT, padx=5)
+
+        tree_frame = ttk.Frame(dialog)
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        scroll_y = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL)
+        tree = ttk.Treeview(tree_frame, columns=("type", "link_target"), show="tree", yscrollcommand=scroll_y.set)
+        scroll_y.config(command=tree.yview)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+
+        tree.column("#0", width=300)
+        tree.column("type", width=80)
+        tree.column("link_target", width=200)
+        tree.heading("type", text="类型")
+        tree.heading("link_target", text="链接目标")
+
+        def refresh_tree():
+            for item in tree.get_children():
+                tree.delete(item)
+            path = current_path.get()
+            try:
+                items = self.sftp.listdir_attr(path)
+
+                def sort_key(attr):
+                    is_dir = (attr.st_mode & 0o040000) != 0
+                    is_link = (attr.st_mode & 0o0120000) == 0o0120000
+                    priority = 0 if is_dir else 1 if is_link else 2
+                    return (priority, attr.filename.lower())
+
+                items.sort(key=sort_key)
+                for attr in items:
+                    name = attr.filename
+                    if name in ('.', '..'):
+                        continue
+                    full = posixpath.join(path, name)
+                    is_link = (attr.st_mode & 0o0120000) == 0o0120000
+                    is_dir = (attr.st_mode & 0o040000) != 0
+                    link_target = ""
+                    if is_link:
+                        try:
+                            link_target = self.sftp.readlink(full)
+                        except:
+                            pass
+                        try:
+                            target_attr = self.sftp.stat(full)
+                            if target_attr.st_mode & 0o040000:
+                                type_str = "目录链接"
+                            else:
+                                type_str = "文件链接"
+                        except:
+                            type_str = "链接"
+                    elif is_dir:
+                        type_str = "目录"
+                    else:
+                        type_str = "文件"
+                    display_text = name
+                    tree.insert("", "end", iid=full, text=display_text,
+                                values=(type_str, link_target),
+                                tags=("link" if is_link else ("dir" if is_dir else "file")))
+                tree.tag_configure("dir", foreground="blue")
+                tree.tag_configure("file", foreground="black")
+                tree.tag_configure("link", foreground="green")
+            except Exception as e:
+                self.log(f"读取远程目录失败: {e}")
+
+        def go_parent():
+            cur = current_path.get()
+            parent = posixpath.dirname(cur)
+            if parent == "":
+                parent = "/"
+            current_path.set(parent)
+            refresh_tree()
+
+        def new_folder():
+            new_dialog = tk.Toplevel(dialog)
+            new_dialog.title("新建文件夹")
+            new_dialog.geometry("300x120")
+            new_dialog.transient(dialog)
+            new_dialog.grab_set()
+            try:
+                new_dialog.iconbitmap(resource_path("md.ico"))
+            except:
+                pass
+            ttk.Label(new_dialog, text="文件夹名称:").pack(pady=10)
+            name_var = tk.StringVar()
+            entry = ttk.Entry(new_dialog, textvariable=name_var, width=30)
+            entry.pack(pady=5)
+
+            def create():
+                name = name_var.get().strip()
+                if not name:
+                    return
+                if '/' in name or '\\' in name:
+                    self.log("文件夹名称不能包含路径分隔符")
+                    return
+                current = current_path.get()
+                new_path = posixpath.join(current, name)
+                try:
+                    self.sftp.mkdir(new_path)
+                    self.log(f"已创建远程目录: {new_path}")
+                    new_dialog.destroy()
+                    refresh_tree()
+                except Exception as e:
+                    self.log(f"创建文件夹失败: {e}")
+
+            ttk.Button(new_dialog, text="创建", command=create).pack(pady=5)
+            entry.bind("<Return>", lambda e: create())
+
+        def delete_selected():
+            selected = tree.selection()
+            if not selected:
+                self.log("请先选中一个文件或文件夹")
+                return
+            path = selected[0]
+            if not tk.messagebox.askyesno("确认删除", f"确定要永久删除 {path} 吗？\n此操作不可恢复！"):
+                return
+
+            def rmtree(remote_path):
+                try:
+                    attr = self.sftp.stat(remote_path)
+                    if attr.st_mode & 0o040000:  # 目录
+                        for item in self.sftp.listdir(remote_path):
+                            rmtree(posixpath.join(remote_path, item))
+                        self.sftp.rmdir(remote_path)
+                    else:
+                        self.sftp.remove(remote_path)
+                except Exception as e:
+                    self.log(f"删除 {remote_path} 失败: {e}")
+                    raise
+
+            try:
+                rmtree(path)
+                self.log(f"已删除: {path}")
+                refresh_tree()
+            except Exception as e:
+                self.log(f"删除失败: {e}")
+
+        def on_double_click(event):
+            item = tree.selection()[0]
+            full_path = item
+            values = tree.item(item, "values")
+            if not values:
+                return
+            type_str = values[0]
+            if type_str in ("目录", "目录链接"):
+                current_path.set(full_path)
+                refresh_tree()
+            else:
+                remote_url = f"ssh://{self.remote_host}{full_path}"
+                target_var.set(remote_url)
+                dialog.destroy()
+
+        tree.bind("<Double-1>", on_double_click)
+
+        def on_ok():
+            selected = tree.selection()
+            if not selected:
+                selected_path = current_path.get()
+            else:
+                selected_path = selected[0]
+            remote_url = f"ssh://{self.remote_host}{selected_path}"
+            target_var.set(remote_url)
+            dialog.destroy()
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(fill=tk.X, pady=5)
+        ttk.Button(btn_frame, text="确定", command=on_ok).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(btn_frame, text="取消", command=dialog.destroy).pack(side=tk.RIGHT)
+
+        refresh_tree()
+
+    def download_remote_path(self, remote_url, suffix_filter=None):
+        """
+        从远程URL下载文件或目录到本地临时目录。
+        参数:
+            remote_url: ssh://host/path 格式的路径
+            suffix_filter: 可选，列表或元组，指定要下载的文件后缀（如 ['.gjf', '.log']）。
+                          为 None 时下载所有文件（但仅限于当前目录，不递归子目录）。
+        返回:
+            本地临时目录路径（如果是目录）或本地文件路径（如果是文件）。
+            如果没有符合过滤条件的文件，返回 None。
+        """
+        if not remote_url.startswith("ssh://"):
+            return remote_url
+        parsed = urllib.parse.urlparse(remote_url)
+        host = parsed.netloc
+        remote_path = parsed.path
+        if not self.sftp:
+            self.log("未连接远程服务器，无法下载")
+            return None
+        temp_dir = self.get_temp_subdir("gauss_remote_")
+        try:
+            attr = self.sftp.stat(remote_path)
+            is_dir = (attr.st_mode & 0o040000) != 0
+        except FileNotFoundError:
+            self.log(f"远程路径不存在: {remote_path}")
+            return None
+        except Exception as e:
+            self.log(f"检查远程路径失败: {e}")
+            return None
+
+        def should_download(filename):
+            if suffix_filter is None:
+                return True
+            return any(filename.lower().endswith(ext.lower()) for ext in suffix_filter)
+
+        def download_dir(remote_dir, local_dir):
+            """下载目录下所有匹配后缀的文件（仅当前目录，不递归子目录）"""
+            os.makedirs(local_dir, exist_ok=True)
+            downloaded_any = False
+            try:
+                items = self.sftp.listdir_attr(remote_dir)
+                for item in items:
+                    if item.filename in ('.', '..'):
+                        continue
+                    # 只处理文件，忽略子目录
+                    if not (item.st_mode & 0o040000):
+                        if should_download(item.filename):
+                            remote_item = posixpath.join(remote_dir, item.filename)
+                            local_item = os.path.join(local_dir, item.filename)
+                            self.sftp.get(remote_item, local_item)
+                            self.log(f"下载文件: {remote_item} -> {local_item}")
+                            downloaded_any = True
+                return downloaded_any
+            except Exception as e:
+                self.log(f"下载目录 {remote_dir} 时出错: {e}")
+                return False
+
+        try:
+            if is_dir:
+                success = download_dir(remote_path, temp_dir)
+                if not success:
+                    self.log(f"远程目录中未找到匹配后缀的文件: {suffix_filter}")
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    return None
+                return temp_dir
+            else:
+                # 单个文件
+                if suffix_filter is not None and not should_download(remote_path):
+                    self.log(f"文件 {remote_path} 不匹配过滤条件 {suffix_filter}，跳过下载")
+                    return None
+                local_file = os.path.join(temp_dir, os.path.basename(remote_path))
+                self.sftp.get(remote_path, local_file)
+                return local_file
+        except Exception as e:
+            self.log(f"下载失败: {e}")
+            import traceback
+            self.log(traceback.format_exc())
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return None
+
+    def cleanup_temp_dir(self, temp_path):
+        """删除临时目录（仅当它在程序temp目录下）"""
+        if not temp_path or not os.path.exists(temp_path):
+            return
+        base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        temp_root = os.path.join(base_dir, "temp")
+        # 确保只删除程序temp目录下的内容
+        if os.path.commonpath([temp_path, temp_root]) == temp_root:
+            shutil.rmtree(temp_path, ignore_errors=True)
+            self.log(f"已清理临时目录: {temp_path}")
+        else:
+            self.log(f"警告：试图删除非程序临时目录 {temp_path}，已忽略")
+
+    def get_temp_subdir(self, prefix):
+        """
+        在程序根目录下的 temp 文件夹中创建一个新的临时子目录。
+        参数 prefix: 子目录前缀（如 'gauss_remote_'）。
+        返回新创建的临时目录的绝对路径。
+        """
+        # 程序根目录（即脚本所在目录，或打包后的 exe 所在目录）
+        base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        temp_root = os.path.join(base_dir, "temp")
+        os.makedirs(temp_root, exist_ok=True)
+        # 创建带前缀的唯一子目录（使用时间戳和随机数避免冲突）
+        import time
+        import random
+        timestamp = int(time.time() * 1000)
+        rand = random.randint(1000, 9999)
+        subdir_name = f"{prefix}{timestamp}_{rand}"
+        subdir_path = os.path.join(temp_root, subdir_name)
+        os.makedirs(subdir_path, exist_ok=True)
+        return subdir_path
+
     # ---------- 辅助方法：添加上拉菜单资源预设 ----------
     def add_resource_preset_ui(self, parent, mem_var, nproc_var):
         row = len(parent.grid_slaves())
@@ -615,6 +1129,8 @@ class GaussianToolGUI(tk.Tk):
         entry.grid(row=row, column=1, padx=5, pady=2)
         ttk.Button(self.param_frame, text="浏览", command=lambda: self.select_folder(self.input_folder_var)).grid(
             row=row, column=2, padx=5, pady=2)
+        ttk.Button(self.param_frame, text="远程", command=lambda: self.select_remote_folder(self.input_folder_var)).grid(
+            row=row, column=3, padx=5, pady=2)
         self.current_widgets.extend([entry, self.param_frame.grid_slaves(row=row, column=0)[0],
                                      self.param_frame.grid_slaves(row=row, column=2)[0]])
         row += 1
@@ -625,6 +1141,8 @@ class GaussianToolGUI(tk.Tk):
         entry.grid(row=row, column=1, padx=5, pady=2)
         ttk.Button(self.param_frame, text="浏览", command=lambda: self.select_folder(self.output_folder_var)).grid(
             row=row, column=2, padx=5, pady=2)
+        ttk.Button(self.param_frame, text="远程", command=lambda: self.select_remote_folder(self.output_folder_var)).grid(
+            row=row, column=3, padx=5, pady=2)
         self.current_widgets.extend([entry, self.param_frame.grid_slaves(row=row, column=0)[0],
                                      self.param_frame.grid_slaves(row=row, column=2)[0]])
         row += 1
@@ -685,6 +1203,8 @@ class GaussianToolGUI(tk.Tk):
         entry.grid(row=row, column=1, padx=5, pady=2)
         ttk.Button(self.param_frame, text="浏览", command=lambda: self.select_folder(self.input_folder_var)).grid(
             row=row, column=2, padx=5, pady=2)
+        ttk.Button(self.param_frame, text="远程", command=lambda: self.select_remote_folder(self.input_folder_var)).grid(
+            row=row, column=3, padx=5, pady=2)
         self.current_widgets.extend([entry, self.param_frame.grid_slaves(row=row, column=0)[0],
                                      self.param_frame.grid_slaves(row=row, column=2)[0]])
         row += 1
@@ -695,6 +1215,8 @@ class GaussianToolGUI(tk.Tk):
         entry.grid(row=row, column=1, padx=5, pady=2)
         ttk.Button(self.param_frame, text="浏览", command=lambda: self.select_folder(self.output_folder_var)).grid(
             row=row, column=2, padx=5, pady=2)
+        ttk.Button(self.param_frame, text="远程", command=lambda: self.select_remote_folder(self.output_folder_var)).grid(
+            row=row, column=3, padx=5, pady=2)
         self.current_widgets.extend([entry, self.param_frame.grid_slaves(row=row, column=0)[0],
                                      self.param_frame.grid_slaves(row=row, column=2)[0]])
         row += 1
@@ -753,10 +1275,10 @@ class GaussianToolGUI(tk.Tk):
         ttk.Label(self.param_frame, text="输入 LOG 文件:").grid(row=row, column=0, sticky=tk.W, padx=5, pady=2)
         entry = ttk.Entry(self.param_frame, textvariable=self.input_file_var, width=50)
         entry.grid(row=row, column=1, padx=5, pady=2)
-        ttk.Button(self.param_frame, text="浏览", command=lambda: self.select_file(self.input_file_var)).grid(row=row,
-                                                                                                              column=2,
-                                                                                                              padx=5,
-                                                                                                              pady=2)
+        ttk.Button(self.param_frame, text="浏览", command=lambda: self.select_file(self.input_file_var)).grid(
+            row=row, column=2, padx=5, pady=2)
+        ttk.Button(self.param_frame, text="远程", command=lambda: self.select_remote_folder(self.input_file_var)).grid(
+            row=row, column=3, padx=5, pady=2)
         self.current_widgets.extend([entry, self.param_frame.grid_slaves(row=row, column=0)[0],
                                      self.param_frame.grid_slaves(row=row, column=2)[0]])
         row += 1
@@ -765,10 +1287,10 @@ class GaussianToolGUI(tk.Tk):
         ttk.Label(self.param_frame, text="输出目录:").grid(row=row, column=0, sticky=tk.W, padx=5, pady=2)
         entry = ttk.Entry(self.param_frame, textvariable=self.output_dir_var, width=50)
         entry.grid(row=row, column=1, padx=5, pady=2)
-        ttk.Button(self.param_frame, text="浏览", command=lambda: self.select_folder(self.output_dir_var)).grid(row=row,
-                                                                                                                column=2,
-                                                                                                                padx=5,
-                                                                                                                pady=2)
+        ttk.Button(self.param_frame, text="浏览", command=lambda: self.select_folder(self.output_dir_var)).grid(
+            row=row, column=2, padx=5, pady=2)
+        ttk.Button(self.param_frame, text="远程", command=lambda: self.select_remote_folder(self.output_dir_var)).grid(
+            row=row, column=3, padx=5, pady=2)
         self.current_widgets.extend([entry, self.param_frame.grid_slaves(row=row, column=0)[0],
                                      self.param_frame.grid_slaves(row=row, column=2)[0]])
         row += 1
@@ -882,165 +1404,248 @@ class GaussianToolGUI(tk.Tk):
 
     def run_modify_gjf(self):
         input_folder = self.input_folder_var.get().strip()
-        if not input_folder:
-            self.log("请选择输入文件夹")
-            return
         output_folder = self.output_folder_var.get().strip()
-        if not output_folder:
-            self.log("请选择输出文件夹")
-            return
-        prefix = self.file_prefix_var.get().strip()
-        if not prefix:
-            self.log("请填写文件名前缀")
-            return
+        temp_input = None
+        try:
+            # 处理远程输入
+            if input_folder.startswith("ssh://"):
+                self.log("检测到远程输入路径，正在下载...")
+                temp_input = self.download_remote_path(input_folder, suffix_filter=['.gjf'])
+                if not temp_input:
+                    self.log("下载远程输入文件夹失败")
+                    return
+                input_folder = temp_input
+                self.log(f"已下载到本地临时目录: {input_folder}")
 
-        mem = self.mem_var.get().strip()
-        nproc = self.nproc_var.get().strip()
-        keyword = self.keyword_var.get().strip()
-        charge = self.charge_var.get().strip()
-        mult = self.mult_var.get().strip()
+            if not input_folder:
+                self.log("请选择输入文件夹")
+                return
+            if not output_folder:
+                self.log("请选择输出文件夹")
+                return
+            prefix = self.file_prefix_var.get().strip()
+            if not prefix:
+                self.log("请填写文件名前缀")
+                return
 
-        gjf_files = glob.glob(os.path.join(input_folder, "*.gjf"))
-        if not gjf_files:
-            self.log("未找到 .gjf 文件")
-            return
+            mem = self.mem_var.get().strip()
+            nproc = self.nproc_var.get().strip()
+            keyword = self.keyword_var.get().strip()
+            charge = self.charge_var.get().strip()
+            mult = self.mult_var.get().strip()
 
-        os.makedirs(output_folder, exist_ok=True)
-        self.log(f"找到 {len(gjf_files)} 个 gjf 文件，输出至 {output_folder}")
-        self.log(f"文件名前缀: {prefix}")
+            gjf_files = glob.glob(os.path.join(input_folder, "*.gjf"))
+            if not gjf_files:
+                self.log("未找到 .gjf 文件")
+                return
 
-        for gjf in gjf_files:
-            basename = os.path.basename(gjf)
-            name, _ = os.path.splitext(basename)
-            output_base = os.path.join(output_folder, f"{prefix}{name}")
-            chk_filename = f"{prefix}{name}.chk"
-            try:
-                new_content = modify_gjf_content(gjf, output_base, mem, nproc, keyword, charge, mult,
-                                                 chk_name=chk_filename)
-                output_path = output_base + ".gjf"
-                with open(output_path, 'w', encoding='utf-8') as f:
-                    f.writelines(new_content)
-                self.log(f"已生成: {output_path} (chk: {chk_filename})")
-            except Exception as e:
-                self.log(f"处理 {gjf} 失败: {e}")
-        self.log("修改 GJF 参数任务完成。")
+            # 处理远程输出
+            is_remote_output = output_folder.startswith("ssh://")
+            local_output = None
+            if is_remote_output:
+                local_output = self.get_temp_subdir("gauss_output_")
+                self.log(f"输出文件夹为远程，将先生成到本地临时目录: {local_output}")
+            else:
+                os.makedirs(output_folder, exist_ok=True)
+                local_output = output_folder
+
+            self.log(f"找到 {len(gjf_files)} 个 gjf 文件，输出至 {output_folder}")
+            self.log(f"文件名前缀: {prefix}")
+
+            for gjf in gjf_files:
+                basename = os.path.basename(gjf)
+                name, _ = os.path.splitext(basename)
+                output_base = os.path.join(local_output, f"{prefix}{name}")
+                chk_filename = f"{prefix}{name}.chk"
+                try:
+                    new_content = modify_gjf_content(gjf, output_base, mem, nproc, keyword, charge, mult,
+                                                     chk_name=chk_filename)
+                    output_path = output_base + ".gjf"
+                    with open(output_path, 'w', encoding='utf-8') as f:
+                        f.writelines(new_content)
+                    self.log(f"已生成: {output_path} (chk: {chk_filename})")
+                except Exception as e:
+                    self.log(f"处理 {gjf} 失败: {e}")
+
+            if is_remote_output:
+                self.upload_directory_to_remote(local_output, output_folder)
+                shutil.rmtree(local_output, ignore_errors=True)
+
+            self.log("修改 GJF 参数任务完成。")
+        finally:
+            if temp_input:
+                self.cleanup_temp_dir(temp_input)
 
     def run_log_to_gjf(self):
         input_folder = self.input_folder_var.get().strip()
-        if not input_folder:
-            self.log("请选择输入文件夹")
-            return
         output_folder = self.output_folder_var.get().strip()
-        if not output_folder:
-            self.log("请选择输出文件夹")
-            return
-        prefix = self.file_prefix_var.get().strip()
-        if not prefix:
-            self.log("请填写文件名前缀")
-            return
+        temp_input = None
+        try:
+            if input_folder.startswith("ssh://"):
+                self.log("检测到远程输入路径，正在下载...")
+                temp_input = self.download_remote_path(input_folder, suffix_filter=['.log'])
+                if not temp_input:
+                    self.log("下载远程输入文件夹失败")
+                    return
+                input_folder = temp_input
+                self.log(f"已下载到本地临时目录: {input_folder}")
 
-        mem = self.mem_var.get().strip()
-        nproc = self.nproc_var.get().strip()
-        keyword = self.keyword_var.get().strip()
-        charge = self.charge_var.get().strip()
-        mult = self.mult_var.get().strip()
+            if not input_folder:
+                self.log("请选择输入文件夹")
+                return
+            if not output_folder:
+                self.log("请选择输出文件夹")
+                return
+            prefix = self.file_prefix_var.get().strip()
+            if not prefix:
+                self.log("请填写文件名前缀")
+                return
 
-        log_files = glob.glob(os.path.join(input_folder, "*.log"))
-        if not log_files:
-            self.log("未找到 .log 文件")
-            return
+            mem = self.mem_var.get().strip()
+            nproc = self.nproc_var.get().strip()
+            keyword = self.keyword_var.get().strip()
+            charge = self.charge_var.get().strip()
+            mult = self.mult_var.get().strip()
 
-        os.makedirs(output_folder, exist_ok=True)
-        self.log(f"找到 {len(log_files)} 个 log 文件，输出至 {output_folder}")
-        self.log(f"文件名前缀: {prefix}")
+            log_files = glob.glob(os.path.join(input_folder, "*.log"))
+            if not log_files:
+                self.log("未找到 .log 文件")
+                return
 
-        for logf in log_files:
-            basename = os.path.basename(logf)
-            name, _ = os.path.splitext(basename)
-            base_full = os.path.splitext(logf)[0]
-            atomic_numbers, coords = parse_log_last_structure(base_full)
-            if not atomic_numbers:
-                self.log(f"无法从 {logf} 提取结构，跳过")
-                continue
-            output_name = f"{prefix}{name}"
-            output_path = os.path.join(output_folder, f"{output_name}.gjf")
-            try:
-                write_gjf_from_coords(output_path, mem, nproc, keyword, charge, mult,
-                                      atomic_numbers, coords, title=f"From {name}")
-                self.log(f"已生成: {output_path}")
-            except Exception as e:
-                self.log(f"生成 {output_name} 失败: {e}")
-        self.log("从 LOG 生成 GJF 任务完成。")
+            is_remote_output = output_folder.startswith("ssh://")
+            local_output = None
+            if is_remote_output:
+                local_output = self.get_temp_subdir("gauss_output_")
+                self.log(f"输出文件夹为远程，将先生成到本地临时目录: {local_output}")
+            else:
+                os.makedirs(output_folder, exist_ok=True)
+                local_output = output_folder
+
+            self.log(f"找到 {len(log_files)} 个 log 文件，输出至 {output_folder}")
+            self.log(f"文件名前缀: {prefix}")
+
+            for logf in log_files:
+                basename = os.path.basename(logf)
+                name, _ = os.path.splitext(basename)
+                base_full = os.path.splitext(logf)[0]
+                atomic_numbers, coords = parse_log_last_structure(base_full)
+                if not atomic_numbers:
+                    self.log(f"无法从 {logf} 提取结构，跳过")
+                    continue
+                output_name = f"{prefix}{name}"
+                output_path = os.path.join(local_output, f"{output_name}.gjf")
+                try:
+                    write_gjf_from_coords(output_path, mem, nproc, keyword, charge, mult,
+                                          atomic_numbers, coords, title=f"From {name}")
+                    self.log(f"已生成: {output_path}")
+                except Exception as e:
+                    self.log(f"生成 {output_name} 失败: {e}")
+
+            if is_remote_output:
+                self.upload_directory_to_remote(local_output, output_folder)
+                shutil.rmtree(local_output, ignore_errors=True)
+
+            self.log("从 LOG 生成 GJF 任务完成。")
+        finally:
+            if temp_input:
+                self.cleanup_temp_dir(temp_input)
 
     def run_extract_scan(self):
         input_log = self.input_file_var.get().strip()
-        if not input_log or not os.path.exists(input_log):
-            self.log("请选择有效的 LOG 文件")
-            return
         output_dir = self.output_dir_var.get().strip()
-        if not output_dir:
-            output_dir = os.path.dirname(input_log)
-        os.makedirs(output_dir, exist_ok=True)
+        temp_input = None
+        try:
+            if input_log.startswith("ssh://"):
+                self.log("检测到远程输入路径，正在下载...")
+                temp_input = self.download_remote_path(input_log, suffix_filter=['.log'])
+                if not temp_input:
+                    self.log("下载远程LOG文件失败")
+                    return
+                input_log = temp_input
+                self.log(f"已下载到本地临时文件: {input_log}")
 
-        with open(input_log, 'r', encoding='utf-8', errors='ignore') as f:
-            lines = f.readlines()
+            if not input_log or not os.path.exists(input_log):
+                self.log("请选择有效的 LOG 文件")
+                return
+            if not output_dir:
+                output_dir = os.path.dirname(input_log)
 
-        orig_route, orig_title, orig_charge, orig_mult = extract_scan_header_info(lines)
-        if self.override_route_var.get() and self.route_entry.get().strip():
-            route = self.route_entry.get().strip()
-        else:
-            route = orig_route
-        if self.override_cm_var.get():
-            try:
-                charge = int(self.charge_scan_var.get())
-                mult = int(self.mult_scan_var.get())
-            except:
+            with open(input_log, 'r', encoding='utf-8', errors='ignore') as f:
+                lines = f.readlines()
+
+            orig_route, orig_title, orig_charge, orig_mult = extract_scan_header_info(lines)
+            if self.override_route_var.get() and self.route_entry.get().strip():
+                route = self.route_entry.get().strip()
+            else:
+                route = orig_route
+            if self.override_cm_var.get():
+                try:
+                    charge = int(self.charge_scan_var.get())
+                    mult = int(self.mult_scan_var.get())
+                except:
+                    charge, mult = orig_charge, orig_mult
+            else:
                 charge, mult = orig_charge, orig_mult
-        else:
-            charge, mult = orig_charge, orig_mult
 
-        steps = extract_modredundant_scan_steps(lines)
-        if not steps:
-            self.log("未找到任何扫描步结构。")
-            return
+            steps = extract_modredundant_scan_steps(lines)
+            if not steps:
+                self.log("未找到任何扫描步结构。")
+                return
 
-        base_name = os.path.splitext(os.path.basename(input_log))[0]
-        self.log(f"共找到 {len(steps)} 个扫描构象，输出至 {output_dir}")
+            base_name = os.path.splitext(os.path.basename(input_log))[0]
+            self.log(f"共找到 {len(steps)} 个扫描构象")
 
-        for step_id, atomic_numbers, coords in steps:
-            gjf_name = f"{base_name}_ScanPoint{step_id}.gjf"
-            out_path = os.path.join(output_dir, gjf_name)
-            try:
-                if self.add_resources_var.get():
-                    mem = self.mem_scan_var.get().strip()
-                    nproc = self.nproc_scan_var.get().strip()
-                    with open(out_path, 'w', encoding='utf-8') as f:
-                        f.write(f"%chk={gjf_name.replace('.gjf', '.chk')}\n")
-                        f.write(f"%mem={mem}\n")
-                        f.write(f"%nprocshared={nproc}\n")
-                        f.write(f"{route}\n")
-                        f.write("\n")
-                        f.write(f"{orig_title} ScanPoint {step_id}\n")
-                        f.write("\n")
-                        f.write(f"{charge} {mult}\n")
-                        for an, (x, y, z) in zip(atomic_numbers, coords):
-                            sym = ATOMIC_NUMBER_TO_SYMBOL.get(an, f"X{an}")
-                            f.write(f" {sym:<2s}  {x:12.6f} {y:12.6f} {z:12.6f}\n")
-                        f.write("\n")
-                else:
-                    with open(out_path, 'w', encoding='utf-8') as f:
-                        f.write(f"{route}\n\n")
-                        f.write(f"{orig_title} ScanPoint {step_id}\n\n")
-                        f.write(f"{charge} {mult}\n")
-                        for an, (x, y, z) in zip(atomic_numbers, coords):
-                            sym = ATOMIC_NUMBER_TO_SYMBOL.get(an, f"X{an}")
-                            f.write(f" {sym:<2s}  {x:12.6f} {y:12.6f} {z:12.6f}\n")
-                        f.write("\n")
-                self.log(f"已生成: {out_path}")
-            except Exception as e:
-                self.log(f"生成 {gjf_name} 失败: {e}")
+            # 处理输出目录（可能为远程）
+            is_remote_output = output_dir.startswith("ssh://")
+            local_output = None
+            if is_remote_output:
+                local_output = self.get_temp_subdir("gauss_output_")
+                self.log(f"输出目录为远程，将先生成到本地临时目录: {local_output}")
+            else:
+                os.makedirs(output_dir, exist_ok=True)
+                local_output = output_dir
 
-        self.log("提取扫描构象任务完成。")
+            for step_id, atomic_numbers, coords in steps:
+                gjf_name = f"{base_name}_ScanPoint{step_id}.gjf"
+                out_path = os.path.join(local_output, gjf_name)
+                try:
+                    if self.add_resources_var.get():
+                        mem = self.mem_scan_var.get().strip()
+                        nproc = self.nproc_scan_var.get().strip()
+                        with open(out_path, 'w', encoding='utf-8') as f:
+                            f.write(f"%chk={gjf_name.replace('.gjf', '.chk')}\n")
+                            f.write(f"%mem={mem}\n")
+                            f.write(f"%nprocshared={nproc}\n")
+                            f.write(f"{route}\n")
+                            f.write("\n")
+                            f.write(f"{orig_title} ScanPoint {step_id}\n")
+                            f.write("\n")
+                            f.write(f"{charge} {mult}\n")
+                            for an, (x, y, z) in zip(atomic_numbers, coords):
+                                sym = ATOMIC_NUMBER_TO_SYMBOL.get(an, f"X{an}")
+                                f.write(f" {sym:<2s}  {x:12.6f} {y:12.6f} {z:12.6f}\n")
+                            f.write("\n")
+                    else:
+                        with open(out_path, 'w', encoding='utf-8') as f:
+                            f.write(f"{route}\n\n")
+                            f.write(f"{orig_title} ScanPoint {step_id}\n\n")
+                            f.write(f"{charge} {mult}\n")
+                            for an, (x, y, z) in zip(atomic_numbers, coords):
+                                sym = ATOMIC_NUMBER_TO_SYMBOL.get(an, f"X{an}")
+                                f.write(f" {sym:<2s}  {x:12.6f} {y:12.6f} {z:12.6f}\n")
+                            f.write("\n")
+                    self.log(f"已生成: {out_path}")
+                except Exception as e:
+                    self.log(f"生成 {gjf_name} 失败: {e}")
+
+            if is_remote_output:
+                self.upload_directory_to_remote(local_output, output_dir)
+                shutil.rmtree(local_output, ignore_errors=True)
+
+            self.log("提取扫描构象任务完成。")
+        finally:
+            if temp_input:
+                self.cleanup_temp_dir(temp_input)
 
     def create_batch_orbital_widgets(self):
         row = 0
@@ -1051,8 +1656,11 @@ class GaussianToolGUI(tk.Tk):
         entry = ttk.Entry(self.param_frame, textvariable=self.batch_orbital_folder_var, width=50)
         entry.grid(row=row, column=1, padx=5, pady=2)
         ttk.Button(self.param_frame, text="浏览",
-                   command=lambda: self.select_folder(self.batch_orbital_folder_var)).grid(row=row, column=2, padx=5,
-                                                                                           pady=2)
+                   command=lambda: self.select_folder(self.batch_orbital_folder_var)).grid(
+                    row=row, column=2, padx=5, pady=2)
+        ttk.Button(self.param_frame, text="远程",
+                   command=lambda: self.select_remote_folder(self.batch_orbital_folder_var)).grid(
+                    row=row, column=3, padx=5, pady=2)
         self.current_widgets.extend([entry, self.param_frame.grid_slaves(row=row, column=0)[0],
                                      self.param_frame.grid_slaves(row=row, column=2)[0]])
         row += 1
@@ -1145,113 +1753,120 @@ class GaussianToolGUI(tk.Tk):
 
     def start_batch_orbital(self):
         folder = self.batch_orbital_folder_var.get().strip()
-        if not folder or not os.path.isdir(folder):
-            self.log("请选择有效的文件夹")
-            return
+        temp_input = None
+        try:
+            # 处理远程输入
+            if folder.startswith("ssh://"):
+                self.log("检测到远程输入路径，正在下载...")
+                temp_input = self.download_remote_path(folder, suffix_filter=['.log'])
+                if not temp_input:
+                    self.log("下载远程文件夹失败")
+                    return
+                folder = temp_input
+                self.log(f"已下载到本地临时目录: {folder}")
 
-        log_files = glob.glob(os.path.join(folder, "*.log"))
-        if not log_files:
-            self.log("未找到 .log 文件")
-            return
+            if not folder or not os.path.isdir(folder):
+                self.log("请选择有效的文件夹")
+                return
 
-        self.log(f"开始处理 {len(log_files)} 个 LOG 文件...")
-        # 清空 Notebook 和数据存储
-        for tab in self.batch_notebook.tabs():
-            self.batch_notebook.forget(tab)
-        self.batch_orbital_data.clear()
+            log_files = glob.glob(os.path.join(folder, "*.log"))
+            if not log_files:
+                self.log("未找到 .log 文件")
+                return
 
-        for logf in log_files:
-            try:
-                data = parse_orbital_energies_advanced(logf)
-                filename = data['filename']
-                # 收集所有轨道数据，用于导出和显示
-                tracks = []  # (spin, type, idx, eng_ha)
-                # Alpha 占据
-                for idx, eng in data['alpha_occ']:
-                    tracks.append(('Alpha', 'Occ', idx, eng))
-                # Alpha 虚
-                for idx, eng in data['alpha_virt']:
-                    tracks.append(('Alpha', 'Vir', idx, eng))
-                # Beta 占据
-                for idx, eng in data['beta_occ']:
-                    tracks.append(('Beta', 'Occ', idx, eng))
-                # Beta 虚
-                for idx, eng in data['beta_virt']:
-                    tracks.append(('Beta', 'Vir', idx, eng))
-                # 按轨道序号排序
-                tracks.sort(key=lambda x: x[2])
-                self.batch_orbital_data.append({'filename': filename, 'tracks': tracks})
+            self.log(f"开始处理 {len(log_files)} 个 LOG 文件...")
+            # 清空 Notebook 和数据存储
+            for tab in self.batch_notebook.tabs():
+                self.batch_notebook.forget(tab)
+            self.batch_orbital_data.clear()
 
-                # 创建 Tab
-                tab_frame = ttk.Frame(self.batch_notebook)
-                self.batch_notebook.add(tab_frame, text=filename.replace('.log', ''))
+            for logf in log_files:
+                try:
+                    data = parse_orbital_energies_advanced(logf)
+                    filename = data['filename']
+                    # 收集所有轨道数据
+                    tracks = []  # (spin, type, idx, eng_ha)
+                    for idx, eng in data['alpha_occ']:
+                        tracks.append(('Alpha', 'Occ', idx, eng))
+                    for idx, eng in data['alpha_virt']:
+                        tracks.append(('Alpha', 'Vir', idx, eng))
+                    for idx, eng in data['beta_occ']:
+                        tracks.append(('Beta', 'Occ', idx, eng))
+                    for idx, eng in data['beta_virt']:
+                        tracks.append(('Beta', 'Vir', idx, eng))
+                    tracks.sort(key=lambda x: x[2])
+                    self.batch_orbital_data.append({'filename': filename, 'tracks': tracks})
 
-                # 在 Tab 内创建 Treeview 显示所有轨道
-                tree_frame = ttk.Frame(tab_frame)
-                tree_frame.pack(fill=tk.BOTH, expand=True)
-                scroll_y = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL)
-                scroll_x = ttk.Scrollbar(tree_frame, orient=tk.HORIZONTAL)
-                tree = ttk.Treeview(tree_frame,
-                                    columns=('spin', 'type', 'index', 'energy_ha', 'energy_ev'),
-                                    show='headings',
-                                    yscrollcommand=scroll_y.set,
-                                    xscrollcommand=scroll_x.set)
-                scroll_y.config(command=tree.yview)
-                scroll_x.config(command=tree.xview)
+                    # 创建 Tab
+                    tab_frame = ttk.Frame(self.batch_notebook)
+                    self.batch_notebook.add(tab_frame, text=filename.replace('.log', ''))
 
-                tree.heading('spin', text='自旋')
-                tree.heading('type', text='类型')
-                tree.heading('index', text='轨道序号')
-                tree.heading('energy_ha', text='能量 (Ha)')
-                tree.heading('energy_ev', text='能量 (eV)')
+                    # Treeview 显示所有轨道（代码省略，与原有相同）
+                    tree_frame = ttk.Frame(tab_frame)
+                    tree_frame.pack(fill=tk.BOTH, expand=True)
+                    scroll_y = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL)
+                    scroll_x = ttk.Scrollbar(tree_frame, orient=tk.HORIZONTAL)
+                    tree = ttk.Treeview(tree_frame,
+                                        columns=('spin', 'type', 'index', 'energy_ha', 'energy_ev'),
+                                        show='headings',
+                                        yscrollcommand=scroll_y.set,
+                                        xscrollcommand=scroll_x.set)
+                    scroll_y.config(command=tree.yview)
+                    scroll_x.config(command=tree.xview)
 
-                tree.column('spin', width=60)
-                tree.column('type', width=80)
-                tree.column('index', width=80)
-                tree.column('energy_ha', width=120)
-                tree.column('energy_ev', width=120)
+                    tree.heading('spin', text='自旋')
+                    tree.heading('type', text='类型')
+                    tree.heading('index', text='轨道序号')
+                    tree.heading('energy_ha', text='能量 (Ha)')
+                    tree.heading('energy_ev', text='能量 (eV)')
 
-                tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-                scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
-                scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
+                    tree.column('spin', width=60)
+                    tree.column('type', width=80)
+                    tree.column('index', width=80)
+                    tree.column('energy_ha', width=120)
+                    tree.column('energy_ev', width=120)
 
-                # 填充轨道数据，并高亮 HOMO/LUMO
-                homo_alpha = data.get('homo_alpha')
-                lumo_alpha = data.get('lumo_alpha')
-                homo_beta = data.get('homo_beta')
-                lumo_beta = data.get('lumo_beta')
+                    tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+                    scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+                    scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
 
-                tree.tag_configure('homo', background='lightgreen')
-                tree.tag_configure('lumo', background='lightblue')
+                    homo_alpha = data.get('homo_alpha')
+                    lumo_alpha = data.get('lumo_alpha')
+                    homo_beta = data.get('homo_beta')
+                    lumo_beta = data.get('lumo_beta')
 
-                homo_item = None  # 用于记录 HOMO 行的 Treeview item ID
-                for spin, typ, idx, eng_ha in tracks:
-                    eng_ev = eng_ha * 27.211386245988
-                    tag = ''
-                    if spin == 'Alpha' and typ == 'Occ' and idx == homo_alpha:
-                        tag = 'homo'
-                    elif spin == 'Alpha' and typ == 'Vir' and idx == lumo_alpha:
-                        tag = 'lumo'
-                    elif spin == 'Beta' and typ == 'Occ' and idx == homo_beta:
-                        tag = 'homo'
-                    elif spin == 'Beta' and typ == 'Vir' and idx == lumo_beta:
-                        tag = 'lumo'
-                    item = tree.insert('', tk.END, values=(spin, typ, idx, f"{eng_ha:.6f}", f"{eng_ev:.4f}"),
-                                       tags=(tag,))
-                    if tag == 'homo':
-                        homo_item = item  # 记录最后一个 HOMO 行（通常只有一行，因为 HOMO 唯一）
+                    tree.tag_configure('homo', background='lightgreen')
+                    tree.tag_configure('lumo', background='lightblue')
 
-                # 自动滚动到 HOMO 行
-                if homo_item:
-                    tree.see(homo_item)
-                    # 可选：同时选中该行，方便定位
-                    tree.selection_set(homo_item)
-                    tree.focus(homo_item)
+                    homo_item = None
+                    for spin, typ, idx, eng_ha in tracks:
+                        eng_ev = eng_ha * 27.211386245988
+                        tag = ''
+                        if spin == 'Alpha' and typ == 'Occ' and idx == homo_alpha:
+                            tag = 'homo'
+                        elif spin == 'Alpha' and typ == 'Vir' and idx == lumo_alpha:
+                            tag = 'lumo'
+                        elif spin == 'Beta' and typ == 'Occ' and idx == homo_beta:
+                            tag = 'homo'
+                        elif spin == 'Beta' and typ == 'Vir' and idx == lumo_beta:
+                            tag = 'lumo'
+                        item = tree.insert('', tk.END, values=(spin, typ, idx, f"{eng_ha:.6f}", f"{eng_ev:.4f}"),
+                                           tags=(tag,))
+                        if tag == 'homo':
+                            homo_item = item
 
-                self.log(f"已处理: {filename} (共 {len(tracks)} 条轨道)")
-            except Exception as e:
-                self.log(f"处理 {logf} 时出错: {e}")
-        self.log("提取完成，请在选项卡中查看各文件的轨道能量（已自动定位到 HOMO 行）")
+                    if homo_item:
+                        tree.see(homo_item)
+                        tree.selection_set(homo_item)
+                        tree.focus(homo_item)
+
+                    self.log(f"已处理: {filename} (共 {len(tracks)} 条轨道)")
+                except Exception as e:
+                    self.log(f"处理 {logf} 时出错: {e}")
+            self.log("提取完成，请在选项卡中查看各文件的轨道能量（已自动定位到 HOMO 行）")
+        finally:
+            if temp_input:
+                self.cleanup_temp_dir(temp_input)
 
     def export_batch_orbital_csv(self):
         if not self.batch_orbital_data:
@@ -1303,6 +1918,8 @@ class GaussianToolGUI(tk.Tk):
         entry.grid(row=row, column=1, padx=5, pady=2)
         ttk.Button(self.param_frame, text="浏览",
                    command=lambda: self.select_folder(self.td_folder_var)).grid(row=row, column=2, padx=5, pady=2)
+        ttk.Button(self.param_frame, text="远程", command=lambda: self.select_remote_folder(self.td_folder_var)).grid(
+            row=row, column=3, padx=5, pady=2)
         self.current_widgets.extend([entry, self.param_frame.grid_slaves(row=row, column=0)[0],
                                      self.param_frame.grid_slaves(row=row, column=2)[0]])
         row += 1
@@ -1327,45 +1944,63 @@ class GaussianToolGUI(tk.Tk):
 
     def start_batch_td(self):
         folder = self.td_folder_var.get().strip()
-        if not folder or not os.path.isdir(folder):
-            self.log("请选择有效的文件夹")
-            return
+        temp_input = None
+        try:
+            if folder.startswith("ssh://"):
+                self.log("检测到远程输入路径，正在下载...")
+                temp_input = self.download_remote_path(folder, suffix_filter=['.log'])
+                if not temp_input:
+                    self.log("下载远程文件夹失败")
+                    return
+                folder = temp_input
+                self.log(f"已下载到本地临时目录: {folder}")
 
-        log_files = glob.glob(os.path.join(folder, "*.log"))
-        if not log_files:
-            self.log("未找到 .log 文件")
-            return
+            if not folder or not os.path.isdir(folder):
+                self.log("请选择有效的文件夹")
+                return
 
-        self.log(f"开始批量解析TD信息，共 {len(log_files)} 个文件...")
-        # 清空Notebook和数据
-        for tab in self.td_notebook.tabs():
-            self.td_notebook.forget(tab)
-        self.batch_td_data.clear()
+            log_files = glob.glob(os.path.join(folder, "*.log"))
+            if not log_files:
+                self.log("未找到 .log 文件")
+                return
 
-        # 使用线程避免界面卡顿
-        threading.Thread(target=self._batch_td_worker, args=(log_files,), daemon=True).start()
+            self.log(f"开始批量解析TD信息，共 {len(log_files)} 个文件...")
+            for tab in self.td_notebook.tabs():
+                self.td_notebook.forget(tab)
+            self.batch_td_data.clear()
 
-    def _batch_td_worker(self, log_files):
-        """后台批量解析TD信息"""
-        for logf in log_files:
-            try:
-                self.log(f"正在解析: {os.path.basename(logf)}")
-                td_data = parse_td_data(logf)  # 注意：parse_td_data 需要能处理没有TD输出的文件，返回空states
-                if not td_data['states']:
-                    self.log(f"警告: {os.path.basename(logf)} 未发现TD激发态信息")
-                    continue
-                self.batch_td_data.append({
-                    'filename': os.path.basename(logf),
-                    'states': td_data['states'],
-                    'orbital_map': td_data.get('orbital_map', {})
-                })
-                # 在主线程中更新GUI
-                self.after(0, self._add_td_tab, os.path.basename(logf), td_data['states'])
-            except Exception as e:
-                self.log(f"解析 {logf} 失败: {e}")
-                import traceback
-                self.log(traceback.format_exc())
-        self.after(0, lambda: self.log("批量TD解析完成"))
+            # 将临时目录传递给工作线程，以便完成后清理
+            threading.Thread(target=self._batch_td_worker, args=(log_files, temp_input), daemon=True).start()
+        except Exception as e:
+            self.log(f"准备失败: {e}")
+            if temp_input:
+                self.cleanup_temp_dir(temp_input)
+
+    def _batch_td_worker(self, log_files, temp_dir_to_clean=None):
+        """后台批量解析TD信息，完成后清理临时目录"""
+        try:
+            for logf in log_files:
+                try:
+                    self.log(f"正在解析: {os.path.basename(logf)}")
+                    td_data = parse_td_data(logf)
+                    if not td_data['states']:
+                        self.log(f"警告: {os.path.basename(logf)} 未发现TD激发态信息")
+                        continue
+                    self.batch_td_data.append({
+                        'filename': os.path.basename(logf),
+                        'states': td_data['states'],
+                        'orbital_map': td_data.get('orbital_map', {})
+                    })
+                    self.after(0, self._add_td_tab, os.path.basename(logf), td_data['states'])
+                except Exception as e:
+                    self.log(f"解析 {logf} 失败: {e}")
+                    import traceback
+                    self.log(traceback.format_exc())
+            self.after(0, lambda: self.log("批量TD解析完成"))
+        finally:
+            if temp_dir_to_clean:
+                # 确保在主线程中清理（避免跨线程删除）
+                self.after(0, lambda: self.cleanup_temp_dir(temp_dir_to_clean))
 
     def _add_td_tab(self, filename, states):
         """为每个文件创建一个选项卡显示TD结果"""
@@ -1567,6 +2202,43 @@ class GaussianToolGUI(tk.Tk):
             return rows
 
         self.export_to_excel(self.batch_td_data, sheet_name_func, headers_func, rows_func, "td_results.xlsx")
+
+    def cleanup_all_temp(self):
+        """程序退出时删除整个 temp 目录"""
+        base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        temp_root = os.path.join(base_dir, "temp")
+        if os.path.exists(temp_root):
+            shutil.rmtree(temp_root, ignore_errors=True)
+
+    def upload_directory_to_remote(self, local_dir, remote_url):
+        """上传本地目录下的所有文件到远程目录（不递归子目录）"""
+        if not remote_url.startswith("ssh://"):
+            return
+        if not self.sftp:
+            self.log("未连接远程服务器，无法上传")
+            return
+        parsed = urllib.parse.urlparse(remote_url)
+        remote_root = parsed.path
+        self._mkdir_p(remote_root)
+        for filename in os.listdir(local_dir):
+            local_file = os.path.join(local_dir, filename)
+            if os.path.isfile(local_file):
+                remote_file = posixpath.join(remote_root, filename)
+                try:
+                    self.sftp.put(local_file, remote_file)
+                    self.log(f"已上传: {local_file} -> {remote_file}")
+                except Exception as e:
+                    self.log(f"上传 {local_file} 失败: {e}")
+
+    def _mkdir_p(self, remote_path):
+        """递归创建远程目录"""
+        if remote_path == "/" or remote_path == "":
+            return
+        try:
+            self.sftp.stat(remote_path)
+        except FileNotFoundError:
+            self._mkdir_p(posixpath.dirname(remote_path))
+            self.sftp.mkdir(remote_path)
 
 
 if __name__ == "__main__":
