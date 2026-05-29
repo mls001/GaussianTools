@@ -393,7 +393,7 @@ def extract_modredundant_scan_steps(lines):
 def parse_td_data(log_path):
     """
     解析高斯log文件中的TD激发态信息，并获取轨道能量。
-    返回一个字典，包含轨道能量映射和激发态列表。
+    返回字典，包含轨道能量映射和激发态列表。
     """
     # 首先获取轨道能量（复用现有函数）
     orbital_data = parse_orbital_energies_advanced(log_path)
@@ -536,7 +536,7 @@ class GaussianToolGUI(tk.Tk):
 
         try:
             img = Image.open(logo_path)
-            # 缩放图片高度为 32 像素，宽度按比例
+            # 缩放图片高度为 64 像素，宽度按比例
             img.thumbnail((64, 64), Image.Resampling.LANCZOS)
             self.logo_img = ImageTk.PhotoImage(img)  # 保持引用
             logo_label = ttk.Label(parent_frame, image=self.logo_img)
