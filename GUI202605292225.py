@@ -95,7 +95,7 @@ def parse_orbital_energies_advanced(log_path):
         for idx in rows:
             beta_virt_energies.extend(extract_energies_from_line(lines[idx]))
 
-    # RHF 后备（如果没有 Alpha 但有 RHF）
+    # RHF 后备（如果没有 Alpha 但有RHF）
     if not alpha_occ_energies:
         rhf_occ_pos = find_last_title(r'Occupied\s*\(RHF\)\s*--')
         if rhf_occ_pos is not None:
