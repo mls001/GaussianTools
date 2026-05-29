@@ -9,7 +9,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext
 from PIL import Image, ImageTk
 from openpyxl import Workbook
-
+import winsound
 # ----------------------------------------------------------------------
 # 公用函数
 # ----------------------------------------------------------------------
@@ -526,23 +526,33 @@ class GaussianToolGUI(tk.Tk):
         self.on_mode_change()
 
     def add_logo(self, parent_frame):
-        # 图片路径：可修改为你的图片文件名，支持相对路径
-        logo_path = os.path.join(os.path.dirname(__file__), "md.jpg")
-        # 如果当前目录没有，尝试 exe 同级目录（打包后适用）
-        if not os.path.exists(logo_path):
-            logo_path = "md.jpg"
+        # 使用 resource_path 获取图片路径（兼容打包）
+        logo_path = resource_path("md.jpg")
         if not os.path.exists(logo_path):
             return
 
+        # 同样使用 resource_path 获取声音文件路径
+        sound_path = resource_path("ha.wav")
+        self.sound_file = sound_path if os.path.exists(sound_path) else None
+
         try:
             img = Image.open(logo_path)
-            # 缩放图片高度为 64 像素，宽度按比例
             img.thumbnail((64, 64), Image.Resampling.LANCZOS)
-            self.logo_img = ImageTk.PhotoImage(img)  # 保持引用
+            self.logo_img = ImageTk.PhotoImage(img)
             logo_label = ttk.Label(parent_frame, image=self.logo_img)
             logo_label.pack(side=tk.RIGHT, padx=5)
+            logo_label.bind("<Button-1>", self.play_sound)
         except Exception as e:
             print(f"加载图片失败: {e}")
+
+    def play_sound(self, event=None):
+        """播放ha.wav声音（支持打包）"""
+        if not hasattr(self, 'sound_file') or not self.sound_file:
+            return
+        try:
+            winsound.PlaySound(self.sound_file, winsound.SND_FILENAME | winsound.SND_ASYNC)
+        except Exception:
+            pass  # 忽略播放错误
 
     def on_mode_change(self):
         if self.param_frame is not None:
