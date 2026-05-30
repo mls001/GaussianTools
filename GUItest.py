@@ -19,6 +19,7 @@ import urllib.parse
 import configparser
 from pathlib import Path
 import atexit
+from PIL import Image, ImageTk, ImageSequence
 # ----------------------------------------------------------------------
 # 公用函数
 # ----------------------------------------------------------------------
@@ -490,18 +491,20 @@ def parse_td_data(log_path):
 class GaussianToolGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("mls V0.0.3")
-        self.geometry("850x700")
+        self.title("mls V0.0.3-alpha")
+        self.geometry("850x850")
         self.resizable(True, True)
         atexit.register(self.cleanup_all_temp)
         # 添加菜单栏
         menubar = tk.Menu(self)
         self.config(menu=menubar)
 
+        self.current_tags = []  # 当前颜色标签
+
         # 远程服务器菜单
         remote_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="远程服务器", menu=remote_menu)
-        remote_menu.add_command(label="连接/断开", command=self.manage_remote_connection)
+        remote_menu.add_command(label="连接服务器", command=self.manage_remote_connection)
         remote_menu.add_separator()
         remote_menu.add_command(label="设置登录头像", command=self.set_avatar)
 
@@ -509,12 +512,10 @@ class GaussianToolGUI(tk.Tk):
         mode_frame.pack(fill=tk.X, padx=5, pady=5)
         icon_path = resource_path("md.ico")
         try:
-            # 方法1：iconbitmap（传统）
             self.iconbitmap(icon_path)
         except:
             pass
         try:
-            # 方法2：iconphoto（更现代，支持 PNG/ICO）
             from PIL import Image, ImageTk
             img = Image.open(icon_path)
             img = img.resize((32, 32), Image.Resampling.LANCZOS)
@@ -529,13 +530,14 @@ class GaussianToolGUI(tk.Tk):
             ("从 LOG 生成 GJF", "log_to_gjf"),
             ("提取扫描构象", "extract_scan"),
             ("批量提取轨道能量", "batch_orbital"),
-            ("提取TD信息", "extract_td")
+            ("提取TD信息", "extract_td"),
+            ("服务器控制台", "console")
         ]
         for text, value in modes:
             ttk.Radiobutton(mode_frame, text=text, variable=self.mode_var,
                             value=value, command=self.on_mode_change).pack(side=tk.LEFT, padx=10)
 
-
+        self.servers_config_file = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "gaussian_servers.ini")
 
         self.param_frame = None
         log_frame = ttk.LabelFrame(self, text="运行日志", padding=5)
@@ -567,6 +569,11 @@ class GaussianToolGUI(tk.Tk):
         self.auth_method = "password"  # 'password' or 'key'
         # 配置文件路径（保存头像和SSH信息）
         self.config_file = os.path.join(os.path.expanduser("~"), ".gaussian_tool_config.ini")
+
+        # 控制台相关
+        self.remote_cwd = "/"  # 远程当前工作目录
+        self.cmd_history = []  # 存储历史命令
+        self.history_index = -1  # 当前历史位置
 
         self.on_mode_change()
         # 在右上角显示头像（使用 tk.Label 以支持边框）
@@ -678,26 +685,188 @@ class GaussianToolGUI(tk.Tk):
             self.create_batch_orbital_widgets()
         elif mode == "extract_td":
             self.create_extract_td_widgets()
+        elif mode == "console":
+            self.create_console_widgets()
         else:
             self.create_extract_scan_widgets()
+
+        # 根据模式显示或隐藏运行按钮
+        if mode in ["batch_orbital", "extract_td", "console"]:
+            self.run_btn.pack_forget()
+        else:
+            if not self.run_btn.winfo_ismapped():
+                self.run_btn.pack(side=tk.RIGHT, padx=5)
 
 # ----------------------------------------------------------------------
 # 远程相关
 # ----------------------------------------------------------------------
     def manage_remote_connection(self):
-        """弹出远程连接管理对话框"""
+        """弹出远程连接管理对话框，支持多服务器配置保存与切换"""
+        # 功能函数
+        def refresh_combo():
+            nonlocal profiles  # 确保可以修改外部变量
+            profiles = self.load_server_profiles()
+            new_names = list(profiles.keys())
+            combo['values'] = new_names
+            print(f"[DEBUG] 刷新配置列表: {new_names}")
+            if new_names:
+                # 不清空当前选中，而是保留原选中（如果存在且仍有效）
+                current_sel = selected_profile.get()
+                if current_sel in new_names:
+                    selected_profile.set(current_sel)
+                    on_profile_select()  # 手动加载当前选中的配置
+                else:
+                    # 原选中无效，选中第一个
+                    first = new_names[0]
+                    selected_profile.set(first)
+                    on_profile_select()
+            else:
+                selected_profile.set("")
+                host_var.set("")
+                port_var.set("22")
+                user_var.set("")
+                password_var.set("")
+                key_var.set("")
+                auth_var.set("password")
+                update_auth_input()
+                status_label.config(text="无保存配置", foreground="orange")
+
+        def save_current_profile():
+            # 弹出输入框，让用户输入配置名称
+            name = tk.simpledialog.askstring("保存配置", "请输入配置名称:", parent=dialog)
+            if not name or not name.strip():
+                return
+            name = name.strip()
+            # 获取当前界面上的连接参数
+            host = host_var.get().strip()
+            port = port_var.get().strip()
+            user = user_var.get().strip()
+            auth = auth_var.get()
+            password = password_var.get()
+            key_file = key_var.get()
+            if not host or not user:
+                status_label.config(text="主机和用户名不能为空", foreground="red")
+                return
+            profile = {
+                'host': host,
+                'port': port,
+                'user': user,
+                'auth': auth,
+                'password': password if auth == 'password' else '',
+                'key_file': key_file if auth == 'key' else ''
+            }
+            # 检查是否已存在同名配置
+            existing_profiles = self.load_server_profiles()
+            if name in existing_profiles:
+                if not tk.messagebox.askyesno("覆盖确认", f"配置 '{name}' 已存在，是否覆盖？", parent=dialog):
+                    return
+            # 保存
+            self.save_server_profile(name, profile)
+            status_label.config(text=f"配置 {name} 已保存", foreground="green")
+            refresh_combo()
+            selected_profile.set(name)
+
+        def delete_current_profile():
+            name = selected_profile.get()
+            if not name:
+                status_label.config(text="未选中任何配置", foreground="red")
+                return
+            if tk.messagebox.askyesno("确认删除", f"确定删除配置 '{name}' 吗？", parent=dialog):
+                self.delete_server_profile(name)
+                status_label.config(text=f"配置 {name} 已删除", foreground="green")
+                refresh_combo()
+                # 清空当前输入
+                host_var.set("")
+                port_var.set("22")
+                user_var.set("")
+                password_var.set("")
+                key_var.set("")
+                auth_var.set("password")
+
+        def do_connect():
+            try:
+                client = paramiko.SSHClient()
+                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                host = host_var.get().strip()
+                port = int(port_var.get().strip())
+                user = user_var.get().strip()
+                if auth_var.get() == "password":
+                    pwd = password_var.get()
+                    client.connect(hostname=host, port=port, username=user, password=pwd, timeout=10)
+                else:
+                    key_path = os.path.expanduser(key_var.get())
+                    key = paramiko.RSAKey.from_private_key_file(key_path)
+                    client.connect(hostname=host, port=port, username=user, pkey=key, timeout=10)
+                # 成功：保存当前连接信息到实例变量和全局配置
+                self.ssh_client = client
+                self.sftp = self.ssh_client.open_sftp()
+                # 设置远程当前目录为用户 home 目录
+                try:
+                    home = f"/home/{self.remote_user}"
+                    self.sftp.stat(home)
+                    self.remote_cwd = home
+                except:
+                    self.remote_cwd = "/"
+                self.remote_host = host
+                self.remote_port = port
+                self.remote_user = user
+                self.auth_method = auth_var.get()
+                if self.auth_method == "password":
+                    self.remote_password = password_var.get()
+                else:
+                    self.remote_key_file = key_var.get()
+                self.save_config()  # 保存到旧配置（用于头像等）
+                status_label.config(text="连接成功", foreground="green")
+                dialog.after(500, dialog.destroy)
+                self.log(f"已连接到 {user}@{host}:{port}")
+                self.after(0, self.update_console_status)
+
+            except Exception as e:
+                status_label.config(text=f"连接失败: {e}", foreground="red")
+
+        def on_profile_select(event=None):
+            name = selected_profile.get()
+            print(f"[DEBUG] 选择配置: {name}")  # 添加调试输出
+            if not name:
+                return
+            # 每次实时加载配置，确保最新
+            all_profiles = self.load_server_profiles()
+            print(f"[DEBUG] 当前配置字典: {all_profiles.keys()}")
+            if name in all_profiles:
+                prof = all_profiles[name]
+                host_var.set(prof.get('host', ''))
+                port_var.set(str(prof.get('port', '22')))
+                user_var.set(prof.get('user', ''))
+                auth_var.set(prof.get('auth', 'password'))
+                password_var.set(prof.get('password', ''))
+                key_var.set(prof.get('key_file', ''))
+                # 强制更新认证输入框的显示
+                update_auth_input()
+                status_label.config(text=f"已加载配置: {name}", foreground="blue")
+                print(f"[DEBUG] 加载成功: host={host_var.get()}, user={user_var.get()}")
+            else:
+                status_label.config(text="配置不存在", foreground="red")
+                print(f"[DEBUG] 配置 '{name}' 不存在")
+
         dialog = tk.Toplevel(self)
         dialog.title("远程服务器连接")
-        dialog.geometry("500x300")
+        dialog.geometry("600x250")
         dialog.resizable(False, False)
         dialog.transient(self)
         dialog.grab_set()
         try:
-            icon_path = resource_path("md.ico")
-            dialog.iconbitmap(icon_path)
+            dialog.iconbitmap(resource_path("md.ico"))
         except Exception:
             pass
-        # 变量
+
+        # 加载已有配置
+        profiles = self.load_server_profiles()
+        profile_names = list(profiles.keys())
+        selected_profile = tk.StringVar()
+        if profile_names:
+            selected_profile.set(profile_names[0])
+
+        # 当前编辑的变量（与界面绑定）
         host_var = tk.StringVar(value=self.remote_host)
         port_var = tk.StringVar(value=str(self.remote_port))
         user_var = tk.StringVar(value=self.remote_user)
@@ -706,6 +875,19 @@ class GaussianToolGUI(tk.Tk):
         key_var = tk.StringVar(value=self.remote_key_file)
 
         row = 0
+        # 配置选择行
+        ttk.Label(dialog, text="已保存配置:").grid(row=row, column=0, sticky=tk.W, padx=5, pady=2)
+        combo = ttk.Combobox(dialog, textvariable=selected_profile, values=profile_names, width=25)
+        combo.grid(row=row, column=1, padx=5, pady=2)
+
+        combo.bind("<<ComboboxSelected>>", on_profile_select)
+        # 加载、保存、删除按钮
+        ttk.Button(dialog, text="刷新列表", command=lambda: refresh_combo()).grid(row=row, column=2, padx=2)
+        ttk.Button(dialog, text="保存当前", command=save_current_profile).grid(row=row, column=3, padx=2)
+        ttk.Button(dialog, text="删除配置", command=delete_current_profile).grid(row=row, column=4, padx=2)
+        row += 1
+
+        # 主机、端口、用户名（原有）
         ttk.Label(dialog, text="主机:").grid(row=row, column=0, sticky=tk.W, padx=5, pady=2)
         ttk.Entry(dialog, textvariable=host_var, width=30).grid(row=row, column=1, padx=5, pady=2)
         ttk.Label(dialog, text="端口:").grid(row=row, column=2, sticky=tk.W, padx=5)
@@ -716,13 +898,14 @@ class GaussianToolGUI(tk.Tk):
         ttk.Entry(dialog, textvariable=user_var, width=30).grid(row=row, column=1, padx=5, pady=2)
         row += 1
 
+        # 认证方式
         ttk.Radiobutton(dialog, text="密码认证", variable=auth_var, value="password").grid(row=row, column=0,
                                                                                            sticky=tk.W, padx=5)
         ttk.Radiobutton(dialog, text="密钥认证", variable=auth_var, value="key").grid(row=row, column=1, sticky=tk.W,
                                                                                       padx=5)
         row += 1
 
-        # 密码/密钥输入框
+        # 密码/密钥输入框（动态切换）
         pass_frame = ttk.Frame(dialog)
         pass_frame.grid(row=row, column=0, columnspan=4, sticky=tk.W, padx=5, pady=2)
         ttk.Label(pass_frame, text="密码/密钥路径:").pack(side=tk.LEFT)
@@ -741,38 +924,32 @@ class GaussianToolGUI(tk.Tk):
         status_label = ttk.Label(dialog, text="", foreground="blue")
         status_label.grid(row=row, column=0, columnspan=4, pady=5)
 
-        def do_connect():
-            try:
-                client = paramiko.SSHClient()
-                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                host = host_var.get().strip()
-                port = int(port_var.get().strip())
-                user = user_var.get().strip()
-                if auth_var.get() == "password":
-                    pwd = password_var.get()
-                    client.connect(hostname=host, port=port, username=user, password=pwd, timeout=10)
-                else:
-                    key_path = os.path.expanduser(key_var.get())
-                    key = paramiko.RSAKey.from_private_key_file(key_path)
-                    client.connect(hostname=host, port=port, username=user, pkey=key, timeout=10)
-                # 成功
-                self.ssh_client = client
-                self.sftp = self.ssh_client.open_sftp()
-                self.remote_host = host
-                self.remote_port = port
-                self.remote_user = user
-                self.auth_method = auth_var.get()
-                if self.auth_method == "password":
-                    self.remote_password = password_var.get()
-                else:
-                    self.remote_key_file = key_var.get()
-                self.save_config()
-                status_label.config(text="连接成功", foreground="green")
-                dialog.after(2000, dialog.destroy)
-            except Exception as e:
-                status_label.config(text=f"连接失败: {e}", foreground="red")
-
         ttk.Button(dialog, text="连接", command=do_connect).grid(row=row + 1, column=0, columnspan=4, pady=10)
+        # 初始刷新
+
+        def animate_gif(frame_idx=0):
+            try:
+                frame = frames[frame_idx]
+                self.remote_conn_img = ImageTk.PhotoImage(frame)
+                img_label.config(image=self.remote_conn_img)
+                next_idx = (frame_idx + 1) % len(frames)
+                # 延迟帧间隔时间
+                delay = frames[frame_idx].info.get('duration', 100)
+                img_label.after(delay, animate_gif, next_idx)
+            except Exception as e:
+                print(f"GIF动画失败: {e}")
+
+        # 加载 GIF
+        gif_path = resource_path("anon.gif")
+        if os.path.exists(gif_path):
+            im = Image.open(gif_path)
+            frames = [frame.copy() for frame in ImageSequence.Iterator(im)]
+            if frames:
+                # 创建标签并启动动画
+                img_label = ttk.Label(dialog, text="")
+                img_label.place(relx=1.0, rely=1.0, anchor='se', x=-10, y=-10)
+                animate_gif(0)
+        refresh_combo()
 
     def disconnect_remote(self):
         if self.sftp:
@@ -1097,6 +1274,332 @@ class GaussianToolGUI(tk.Tk):
         subdir_path = os.path.join(temp_root, subdir_name)
         os.makedirs(subdir_path, exist_ok=True)
         return subdir_path
+
+    def load_server_profiles(self):
+        """加载所有服务器配置，返回字典 {配置名称: {host, port, user, auth, password, key_file}}"""
+        config = configparser.ConfigParser()
+        profiles = {}
+        if os.path.exists(self.servers_config_file):
+            config.read(self.servers_config_file)
+            for section in config.sections():
+                profiles[section] = {
+                    'host': config[section].get('host', ''),
+                    'port': config[section].get('port', '22'),
+                    'user': config[section].get('user', ''),
+                    'auth': config[section].get('auth', 'password'),
+                    'password': config[section].get('password', ''),
+                    'key_file': config[section].get('key_file', '')
+                }
+        return profiles
+
+    def save_server_profile(self, name, profile):
+        """保存单个服务器配置到文件（覆盖或新增）"""
+        config = configparser.ConfigParser()
+        if os.path.exists(self.servers_config_file):
+            config.read(self.servers_config_file)
+        config[name] = {
+            'host': profile['host'],
+            'port': profile['port'],
+            'user': profile['user'],
+            'auth': profile['auth'],
+            'password': profile.get('password', ''),
+            'key_file': profile.get('key_file', '')
+        }
+        with open(self.servers_config_file, 'w') as f:
+            config.write(f)
+
+    def delete_server_profile(self, name):
+        """删除指定名称的服务器配置"""
+        config = configparser.ConfigParser()
+        if os.path.exists(self.servers_config_file):
+            config.read(self.servers_config_file)
+            if name in config:
+                config.remove_section(name)
+                with open(self.servers_config_file, 'w') as f:
+                    config.write(f)
+                return True
+        return False
+
+    def create_console_widgets(self):
+        """服务器控制台模式界面 - 真正的终端"""
+        # 状态栏
+        status_frame = ttk.Frame(self.param_frame)
+        status_frame.pack(fill=tk.X, padx=5, pady=5)
+        self.console_status = ttk.Label(status_frame, text="未连接", foreground="red")
+        self.console_status.pack(side=tk.LEFT, padx=5)
+        ttk.Button(status_frame, text="刷新状态", command=self.update_console_status).pack(side=tk.LEFT, padx=5)
+
+        # 终端区域
+        terminal_frame = ttk.LabelFrame(self.param_frame, text="终端(伪)", padding=5)
+        terminal_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.terminal = tk.Text(terminal_frame, wrap=tk.CHAR, bg='#2b2b2b', fg='white',
+                                insertbackground='white', font=('Consolas', 10),
+                                relief=tk.FLAT, borderwidth=0)
+        self.terminal.pack(fill=tk.BOTH, expand=True)
+        # 配置 tag 用于颜色
+        self.terminal.tag_configure('error', foreground='red')
+        self.terminal.tag_configure('color_red', foreground='red')
+        self.terminal.tag_configure('color_green', foreground='green')
+        self.terminal.tag_configure('color_yellow', foreground='yellow')
+        self.terminal.tag_configure('color_blue', foreground='#1E90FF')
+        self.terminal.tag_configure('color_magenta', foreground='magenta')
+        self.terminal.tag_configure('color_cyan', foreground='cyan')
+        self.terminal.tag_configure('color_white', foreground='white')
+        self.terminal.tag_configure('color_bold', font=('Consolas', 10, 'bold'))
+
+        # 绑定键盘事件（所有按键都发送到远程）
+        self.terminal.bind("<Button-3>", self.show_terminal_context_menu)
+        self.terminal.bind('<Key>', self.on_terminal_key)
+        # self.terminal.bind('<Control-c>', lambda e: self.send_special_char('\x03'))
+        self.terminal.focus_set()
+
+        # 按钮区域
+        btn_frame = ttk.Frame(self.param_frame)
+        btn_frame.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Button(btn_frame, text="启动终端", command=self.start_shell).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="断开终端", command=self.disconnect_shell).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="清屏", command=self.clear_terminal).pack(side=tk.LEFT, padx=5)
+
+        # 初始化变量
+        self.shell_channel = None
+        self.shell_thread_running = False
+
+        self.update_console_status()
+
+    def update_console_status(self):
+        if not hasattr(self, 'console_status') or self.console_status is None:
+            return
+        if self.ssh_client and self.sftp:
+            status = f"已连接: {self.remote_user}@{self.remote_host}:{self.remote_port}"
+            if self.shell_channel and self.shell_channel.active:
+                status += " | 终端活跃"
+            else:
+                status += " | 终端未启动"
+            self.console_status.config(text=status, foreground="green")
+        else:
+            self.console_status.config(text="未连接", foreground="red")
+
+    def start_shell(self):
+        """启动远程终端会话"""
+        if not self.ssh_client or not self.sftp:
+            self.log("请先通过「远程服务器」菜单连接")
+            return
+        if self.shell_channel and self.shell_channel.active:
+            self.log("终端已在运行")
+            return
+        try:
+            # 请求一个伪终端，自动获取当前用户环境
+            self.shell_channel = self.ssh_client.invoke_shell(term='xterm', width=120, height=40)
+            self.shell_thread_running = True
+            threading.Thread(target=self._read_shell_output, daemon=True).start()
+            self.log("终端已启动")
+            self.update_console_status()
+        except Exception as e:
+            self.log(f"启动终端失败: {e}")
+
+    def disconnect_shell(self):
+        """断开终端连接"""
+        if self.shell_channel:
+            self.shell_thread_running = False
+            self.shell_channel.close()
+            self.shell_channel = None
+            self.log("终端已断开")
+            self.update_console_status()
+
+    def clear_terminal(self):
+        """清空终端显示"""
+        self.terminal.delete(1.0, tk.END)
+
+    def on_terminal_key(self, event):
+        """处理键盘输入，发送到远程 shell，并本地模拟退格"""
+        if not self.shell_channel or not self.shell_channel.active:
+            return
+        key = event.keysym
+        if key == 'Return':
+            char = '\r'
+        elif key == 'BackSpace':
+            # 向服务器发送退格符
+            self.shell_channel.send('\x08')
+            # 本地删除光标前一个字符（如果有）
+            try:
+                cursor_pos = self.terminal.index(tk.INSERT)
+                if cursor_pos != "1.0":
+                    self.terminal.delete(f"{cursor_pos} -1c", cursor_pos)
+            except:
+                pass
+            return 'break'  # 阻止默认插入
+        elif key == 'Tab':
+            char = '\t'
+        elif key == 'Up':
+            char = '\x1b[A'
+        elif key == 'Down':
+            char = '\x1b[B'
+        elif key == 'Left':
+            char = '\x1b[D'
+        elif key == 'Right':
+            char = '\x1b[C'
+        elif key == 'Home':
+            char = '\x1b[H'
+        elif key == 'End':
+            char = '\x1b[F'
+        elif key == 'Delete':
+            char = '\x1b[3~'
+        elif key.startswith('F') and len(key) == 2:
+            num = key[1:]
+            char = f'\x1bOP' if num == '1' else f'\x1b[{num}~'
+        elif len(event.char) > 0:
+            char = event.char
+        else:
+            return 'break'
+        self.shell_channel.send(char)
+        return 'break'
+
+    def send_special_char(self, char):
+        """发送控制字符"""
+        if self.shell_channel:
+            self.shell_channel.send(char)
+
+    def _read_shell_output(self):
+        """线程函数：持续读取远程 shell 输出并显示"""
+        import time
+        while self.shell_thread_running and self.shell_channel and not self.shell_channel.closed:
+            try:
+                if self.shell_channel.recv_ready():
+                    data = self.shell_channel.recv(4096)
+                    # 尝试解码，忽略无法解码的字节
+                    try:
+                        text = data.decode('utf-8')
+                    except UnicodeDecodeError:
+                        text = data.decode('latin-1')
+                    self.after(0, lambda t=text: self._display_terminal_output(t))
+                else:
+                    time.sleep(0.05)
+            except Exception as e:
+                self.after(0, lambda: self.log(f"终端读取错误: {e}"))
+                break
+        self.after(0, self.disconnect_shell)
+
+    def _display_terminal_output(self, text):
+        """处理远程输出，保留颜色，移除 OSC 序列和退格符回显"""
+        i = 0
+        n = len(text)
+        while i < n:
+            ch = text[i]
+            if ch == '\x1b':  # ESC 开始
+                if i + 1 < n and text[i + 1] == ']':  # OSC 序列 ESC] ... BEL
+                    j = i + 2
+                    while j < n and text[j] != '\x07':
+                        j += 1
+                    if j < n and text[j] == '\x07':
+                        i = j + 1  # 跳过整个 OSC 序列
+                        continue
+                elif i + 1 < n and text[i + 1] == '[':  # CSI 序列
+                    j = i + 2
+                    while j < n and not text[j].isalpha():
+                        j += 1
+                    if j < n:
+                        cmd = text[i:j + 1]
+                        if cmd.endswith('m'):  # 颜色码
+                            codes = cmd[2:-1]
+                            self._apply_ansi_codes(codes)
+                        # 其他 CSI 序列忽略（不显示）
+                        i = j + 1
+                        continue
+            elif ch == '\x08':  # 退格符忽略（本地已删除）
+                i += 1
+                continue
+            elif ch == '\r':  # 回车：移动到行首，简单处理为不换行（但可能覆盖）
+                # 更好的处理：获取当前行内容并替换，但为简化，暂时忽略覆盖
+                i += 1
+                continue
+            else:
+                # 普通字符
+                self.terminal.insert(tk.END, ch, tuple(self.current_tags))
+                i += 1
+                continue
+            i += 1
+        self.terminal.see(tk.END)
+
+    def _apply_ansi_codes(self, codes_str):
+        """根据 ANSI 码修改 self.current_tags"""
+        if not codes_str:
+            self.current_tags.clear()
+            return
+        codes = codes_str.split(';')
+        for code_str in codes:
+            try:
+                code = int(code_str)
+            except ValueError:
+                continue
+            if code == 0:  # 重置
+                self.current_tags.clear()
+            elif code == 1:  # 粗体
+                if 'color_bold' not in self.current_tags:
+                    self.current_tags.append('color_bold')
+            elif code == 31:  # 红色
+                self._replace_color_tag('color_red')
+            elif code == 32:  # 绿色
+                self._replace_color_tag('color_green')
+            elif code == 33:  # 黄色
+                self._replace_color_tag('color_yellow')
+            elif code == 34:  # 蓝色
+                self._replace_color_tag('color_blue')
+            elif code == 35:  # 品红
+                self._replace_color_tag('color_magenta')
+            elif code == 36:  # 青色
+                self._replace_color_tag('color_cyan')
+            elif code == 37:  # 白色
+                self._replace_color_tag('color_white')
+            # 其他代码可忽略
+
+    def _replace_color_tag(self, new_tag):
+        """替换当前标签中的颜色标签"""
+        # 移除所有颜色标签
+        self.current_tags = [t for t in self.current_tags if not t.startswith('color_')]
+        self.current_tags.append(new_tag)
+
+    def parse_ansi_and_insert(self, text):
+        """移除所有 ANSI 控制序列和退格符，插入纯文本"""
+        # 移除 CSI 序列: ESC [ 参数 字母
+        cleaned = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)
+        # 移除 OSC 序列: ESC ] ... BEL
+        cleaned = re.sub(r'\x1b\][^\x07]*\x07', '', cleaned)
+        # 移除其他控制字符，包括退格 (\x08)、响铃 (\x07) 等，但保留回车 \r 和换行 \n
+        cleaned = re.sub(r'[\x00-\x07\x0b\x0c\x0e-\x1f\x7f]', '', cleaned)
+        self.terminal.insert(tk.END, cleaned)
+        self.terminal.see(tk.END)
+
+    def show_terminal_context_menu(self, event):
+        """显示终端右键菜单（复制/粘贴）"""
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="复制", command=self.copy_from_terminal)
+        menu.add_command(label="粘贴", command=self.paste_to_terminal)
+        menu.post(event.x_root, event.y_root)
+
+    def paste_to_terminal(self):
+        """粘贴剪贴板内容到远程终端"""
+        if not self.shell_channel or not self.shell_channel.active:
+            return
+        try:
+            # 尝试获取剪贴板文本
+            clipboard_text = self.clipboard_get()
+            if clipboard_text:
+                self.shell_channel.send(clipboard_text)
+        except tk.TclError:
+            pass  # 剪贴板为空或无法获取
+
+    def copy_from_terminal(self):
+        """复制终端中选中的文本到剪贴板"""
+        try:
+            # 获取选中的文本范围
+            selected = self.terminal.get(tk.SEL_FIRST, tk.SEL_LAST)
+            if selected:
+                self.clipboard_clear()
+                self.clipboard_append(selected)
+        except tk.TclError:
+            # 没有选中文本时忽略
+            pass
+
 
     # ---------- 辅助方法：添加上拉菜单资源预设 ----------
     def add_resource_preset_ui(self, parent, mem_var, nproc_var):
