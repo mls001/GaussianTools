@@ -1359,7 +1359,7 @@ class GaussianToolGUI(tk.Tk):
         ttk.Button(btn_frame, text="启动终端", command=self.start_shell).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="断开终端", command=self.disconnect_shell).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="清屏", command=self.clear_terminal).pack(side=tk.LEFT, padx=5)
-
+        ttk.Button(btn_frame, text="上传文件", command=self.upload_file_to_remote).pack(side=tk.LEFT, padx=5)
         # 初始化变量
         self.shell_channel = None
         self.shell_thread_running = False
@@ -1405,6 +1405,176 @@ class GaussianToolGUI(tk.Tk):
             self.shell_channel = None
             self.log("终端已断开")
             self.update_console_status()
+
+    def choose_remote_directory(self):
+        """弹出一个仅选择远程目录的对话框，支持进入目录链接，返回远程路径（绝对路径），取消则返回 None"""
+        if not self.sftp:
+            self.log("请先连接远程服务器")
+            return None
+        dialog = tk.Toplevel(self)
+        dialog.title("选择远程目录")
+        dialog.geometry("700x500")
+        dialog.transient(self)
+        dialog.grab_set()
+        try:
+            dialog.iconbitmap(resource_path("md.ico"))
+        except:
+            pass
+
+        # 当前路径（默认 home）
+        default_path = f"/home/{self.remote_user}"
+        try:
+            self.sftp.stat(default_path)
+        except:
+            default_path = "/"
+        current_path = tk.StringVar(value=default_path)
+
+        # 顶部路径栏
+        path_frame = ttk.Frame(dialog)
+        path_frame.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Label(path_frame, text="路径:").pack(side=tk.LEFT)
+        path_entry = ttk.Entry(path_frame, textvariable=current_path)
+        path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Button(path_frame, text="刷新", command=lambda: refresh_tree()).pack(side=tk.LEFT)
+        ttk.Button(path_frame, text="上级", command=lambda: go_parent()).pack(side=tk.LEFT)
+
+        # 文件树
+        tree_frame = ttk.Frame(dialog)
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        scroll_y = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL)
+        tree = ttk.Treeview(tree_frame, columns=("type",), show="tree", yscrollcommand=scroll_y.set)
+        scroll_y.config(command=tree.yview)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+
+        tree.column("#0", width=300)
+        tree.column("type", width=80)
+        tree.heading("type", text="类型")
+
+        def refresh_tree():
+            for item in tree.get_children():
+                tree.delete(item)
+            path = current_path.get()
+            try:
+                items = self.sftp.listdir_attr(path)
+
+                # 排序：目录优先，链接其次
+                def sort_key(attr):
+                    is_dir = (attr.st_mode & 0o040000) != 0
+                    is_link = (attr.st_mode & 0o0120000) == 0o0120000
+                    priority = 0 if is_dir else 1 if is_link else 2
+                    return (priority, attr.filename.lower())
+
+                items.sort(key=sort_key)
+                for attr in items:
+                    name = attr.filename
+                    if name in ('.', '..'):
+                        continue
+                    full = posixpath.join(path, name)
+                    is_link = (attr.st_mode & 0o0120000) == 0o0120000
+                    is_dir = (attr.st_mode & 0o040000) != 0
+                    type_str = ""
+                    if is_link:
+                        # 检查链接目标是否为目录
+                        try:
+                            target_attr = self.sftp.stat(full)  # stat 解析链接
+                            if target_attr.st_mode & 0o040000:
+                                type_str = "目录链接"
+                            else:
+                                type_str = "文件链接"
+                        except:
+                            type_str = "链接"
+                    elif is_dir:
+                        type_str = "目录"
+                    else:
+                        type_str = "文件"
+                    # 只显示目录和目录链接（因为我们要选择目录）
+                    if type_str in ("目录", "目录链接"):
+                        tree.insert("", "end", iid=full, text=name, values=(type_str,))
+                tree.tag_configure("dir", foreground="blue")
+                tree.tag_configure("link", foreground="green")
+            except Exception as e:
+                self.log(f"读取目录失败: {e}")
+
+        def go_parent():
+            cur = current_path.get()
+            parent = posixpath.dirname(cur)
+            if parent == "":
+                parent = "/"
+            current_path.set(parent)
+            refresh_tree()
+
+        def on_double_click(event):
+            item = tree.selection()[0]
+            full = item
+            values = tree.item(item, "values")
+            if values and (values[0] == "目录" or values[0] == "目录链接"):
+                current_path.set(full)
+                refresh_tree()
+
+        tree.bind("<Double-1>", on_double_click)
+
+        result = None
+
+        def on_ok():
+            nonlocal result
+            result = current_path.get()
+            dialog.destroy()
+
+        def on_cancel():
+            dialog.destroy()
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(fill=tk.X, pady=5)
+        ttk.Button(btn_frame, text="确定", command=on_ok).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(btn_frame, text="取消", command=on_cancel).pack(side=tk.RIGHT, padx=5)
+
+        refresh_tree()
+        self.wait_window(dialog)
+        return result
+
+    def upload_file_to_remote(self):
+        """上传本地文件到远程服务器（手动选择目标目录）"""
+        if not self.sftp:
+            self.log("请先连接远程服务器")
+            return
+        # 选择本地文件
+        local_path = filedialog.askopenfilename(title="选择要上传的文件")
+        if not local_path:
+            return
+        # 选择远程目录
+        remote_dir = self.choose_remote_directory()
+        if not remote_dir:
+            self.log("未选择远程目录，上传取消")
+            return
+        remote_filename = os.path.basename(local_path)
+        remote_path = posixpath.join(remote_dir, remote_filename)
+        # 确认上传
+        if not tk.messagebox.askyesno(
+                "确认上传",
+                f"本地文件: {os.path.basename(local_path)}\n将上传到: {remote_path}\n\n确定吗？"
+        ):
+            return
+
+        def upload_task():
+            try:
+                self._mkdir_p(remote_dir)
+                self.sftp.put(local_path, remote_path)
+                self.log(f"文件已上传: {local_path} -> {remote_path}")
+            except Exception as e:
+                self.log(f"上传失败: {e}")
+
+        threading.Thread(target=upload_task, daemon=True).start()
+
+    def _mkdir_p(self, remote_path):
+        """递归创建远程目录"""
+        if remote_path == "/" or remote_path == "":
+            return
+        try:
+            self.sftp.stat(remote_path)
+        except FileNotFoundError:
+            self._mkdir_p(posixpath.dirname(remote_path))
+            self.sftp.mkdir(remote_path)
 
     def clear_terminal(self):
         """清空终端显示"""
@@ -1557,17 +1727,6 @@ class GaussianToolGUI(tk.Tk):
         # 移除所有颜色标签
         self.current_tags = [t for t in self.current_tags if not t.startswith('color_')]
         self.current_tags.append(new_tag)
-
-    def parse_ansi_and_insert(self, text):
-        """移除所有 ANSI 控制序列和退格符，插入纯文本"""
-        # 移除 CSI 序列: ESC [ 参数 字母
-        cleaned = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)
-        # 移除 OSC 序列: ESC ] ... BEL
-        cleaned = re.sub(r'\x1b\][^\x07]*\x07', '', cleaned)
-        # 移除其他控制字符，包括退格 (\x08)、响铃 (\x07) 等，但保留回车 \r 和换行 \n
-        cleaned = re.sub(r'[\x00-\x07\x0b\x0c\x0e-\x1f\x7f]', '', cleaned)
-        self.terminal.insert(tk.END, cleaned)
-        self.terminal.see(tk.END)
 
     def show_terminal_context_menu(self, event):
         """显示终端右键菜单（复制/粘贴）"""
@@ -2443,6 +2602,7 @@ class GaussianToolGUI(tk.Tk):
         ttk.Button(btn_frame, text="批量解析TD", command=self.start_batch_td).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="导出CSV（合并）", command=self.export_batch_td_csv).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="导出Excel（多sheet）", command=self.export_batch_td_excel).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="绘制能级图", command=self.plot_current_td_energy).pack(side=tk.LEFT, padx=5)
         self.current_widgets.append(btn_frame)
         row += 1
 
@@ -2633,6 +2793,129 @@ class GaussianToolGUI(tk.Tk):
                                         f"        轨道能量: {from_eng:8.6f} Ha → {to_eng:8.6f} Ha, 能量差: {delta:8.6f} Ha ({delta * 27.211386:8.4f} eV)\n")
             self.td_text.insert(tk.END, "\n")
         self.td_text.see(tk.END)
+
+    def plot_current_td_energy(self):
+        """绘制能级图，线段无偏移，仅当能级差<0.01时文字交替放在线段左侧或右侧"""
+        current_tab = self.td_notebook.select()
+        if not current_tab:
+            self.log("未选中任何TD文件，请先批量解析TD并选择一个选项卡")
+            return
+        tab_text = self.td_notebook.tab(current_tab, "text")
+        td_data = None
+        for item in self.batch_td_data:
+            if item['filename'].replace('.log', '') == tab_text:
+                td_data = item
+                break
+        if not td_data:
+            self.log(f"未找到文件 {tab_text} 的TD数据")
+            return
+
+        states = td_data['states']
+        if not states:
+            self.log("该文件没有激发态信息")
+            return
+
+        # 分离单线态和三线态，按能量排序
+        singlets = []
+        triplets = []
+        for s in states:
+            if 'Singlet' in s['mult_type']:
+                singlets.append(s['energy_eV'])
+            elif 'Triplet' in s['mult_type']:
+                triplets.append(s['energy_eV'])
+        singlets.sort()
+        triplets.sort()
+
+        if not singlets and not triplets:
+            self.log("没有检测到单线态或三线态")
+            return
+
+        all_energies = singlets + triplets
+        min_e = min(all_energies)
+        max_e = max(all_energies)
+        y_min = min_e - 0.2
+        y_max = max_e + 0.2
+
+        try:
+            import matplotlib
+            matplotlib.use('TkAgg')
+            import matplotlib.pyplot as plt
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+            import platform
+            if platform.system() == 'Windows':
+                plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'Arial Unicode MS']
+            else:
+                plt.rcParams['font.sans-serif'] = ['WenQuanYi Zen Hei', 'Arial Unicode MS']
+            plt.rcParams['axes.unicode_minus'] = False
+        except ImportError:
+            self.log("需要安装 matplotlib 库才能绘图，请运行: pip install matplotlib")
+            return
+
+        plot_window = tk.Toplevel(self)
+        plot_window.title(f"{td_data['filename']}")
+        plot_window.geometry("600x850")
+
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.set_ylim(y_min, y_max)
+        ax.set_xlim(-0.5, 1.5)
+        ax.set_xlabel("")
+        ax.set_xticks([])
+        ax.set_ylabel("能量 (eV)", fontsize=12)
+        ax.set_title(f"{td_data['filename']}", fontsize=14)
+        ax.axhline(y=0, color='black', linestyle='-', linewidth=1, label='基态')
+
+        def draw_levels(ax, energies, side, color, prefix, base_left, base_right,
+                        threshold=0.01, text_offset=0.12):
+            """无水平偏移，仅当能级差小于阈值时文字交替放在线段左侧/右侧"""
+            last_energy = None
+            last_text_side = 'right'  # 默认右侧
+            for i, eng in enumerate(energies):
+                # 线段固定位置（不偏移）
+                if side == 'left':
+                    x_left = base_left
+                    x_right = base_right
+                else:
+                    x_left = base_left
+                    x_right = base_right
+
+                ax.hlines(eng, x_left, x_right, colors=color, linewidth=2)
+
+                # 决定文字侧边：若与上一个能级过于接近，则切换侧边
+                if last_energy is not None and (eng - last_energy) < threshold:
+                    last_text_side = 'left' if last_text_side == 'right' else 'right'
+                else:
+                    last_text_side = 'right'  # 默认右侧
+                if last_text_side == 'right':
+                    text_x = x_right + text_offset
+                    ha = 'left'
+                else:
+                    text_x = x_left - text_offset
+                    ha = 'right'
+
+                label = f"{prefix}{i + 1}  {eng:.2f}eV"
+                ax.text(text_x, eng, label, verticalalignment='center',
+                        horizontalalignment=ha, fontsize=9, color=color)
+
+                last_energy = eng
+
+        # 左侧单线态，线段范围 [-0.12, 0.12]
+        if singlets:
+            draw_levels(ax, singlets, 'left', 'red', 'S', -0.12, 0.12,
+                        threshold=0.01, text_offset=0.12)
+        # 右侧三线态，线段范围 [0.88, 1.12]
+        if triplets:
+            draw_levels(ax, triplets, 'right', 'blue', 'T', 0.88, 1.12,
+                        threshold=0.01, text_offset=0.12)
+
+        canvas = FigureCanvasTkAgg(fig, master=plot_window)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        def on_close():
+            plt.close(fig)
+            plot_window.destroy()
+
+        plot_window.protocol("WM_DELETE_WINDOW", on_close)
 
     def export_to_excel(self, data_list, sheet_name_func, headers_func, rows_func, default_filename="output.xlsx"):
         """将多个数据集导出到同一个Excel文件的不同sheet"""
