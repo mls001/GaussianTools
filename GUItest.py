@@ -20,6 +20,7 @@ import configparser
 from pathlib import Path
 import atexit
 from PIL import Image, ImageTk, ImageSequence
+from tkinterdnd2 import TkinterDnD, DND_FILES
 # ----------------------------------------------------------------------
 # 公用函数
 # ----------------------------------------------------------------------
@@ -400,7 +401,7 @@ def extract_modredundant_scan_steps(lines):
     return steps
 
 
-def parse_td_data(log_path):
+def parse_td_data0(log_path):
     """
     解析高斯log文件中的TD激发态信息，并获取轨道能量。
     返回字典，包含轨道能量映射和激发态列表。
@@ -484,14 +485,105 @@ def parse_td_data(log_path):
     return {'orbital_map': orb_energy_map, 'states': states}
 
 
+def parse_td_data(log_path):
+    """
+    解析高斯log文件中的TD激发态信息，并获取轨道能量。
+    对于TDOPT任务，只提取最后一次优化迭代后的所有激发态（从最后一次的 State 1 开始）。
+    返回字典，包含轨道能量映射和激发态列表。
+    """
+    # 获取轨道能量（自动取最后一次SCF）
+    orbital_data = parse_orbital_energies_advanced(log_path)
+    orb_energy_map = {}
+    for idx, eng in orbital_data.get('alpha_occ', []):
+        orb_energy_map[idx] = eng
+    for idx, eng in orbital_data.get('alpha_virt', []):
+        orb_energy_map[idx] = eng
+    for idx, eng in orbital_data.get('beta_occ', []):
+        orb_energy_map[idx] = eng
+    for idx, eng in orbital_data.get('beta_virt', []):
+        orb_energy_map[idx] = eng
+
+    with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
+        content = f.read()
+
+    # 使用正则查找最后一个 "Excited State  1:" 的位置（确保匹配多种空格）
+    import re
+    pattern = re.compile(r'Excited\s+State\s+1:')
+    matches = list(pattern.finditer(content))
+    if matches:
+        last_match = matches[-1]
+        start_pos = last_match.start()
+        # 从该位置开始截取内容
+        content = content[start_pos:]
+    else:
+        # 如果没有找到 "Excited State 1:"，则保留全部内容（普通TD任务）
+        pass
+
+    # 正则匹配激发态块（现在只包含最后一次迭代的激发态）
+    state_pattern = re.compile(
+        r'^\s*Excited\s+State\s+(\d+):\s+(\S+)\s+([\d\.]+)\s+eV\s+([\d\.]+)\s+nm\s+f=([\d\.Ee+-]+)',
+        re.M
+    )
+    trans_pattern = re.compile(r'^\s*(\d+)\s*->\s*(\d+)\s+([-+]?[\d\.Ee+-]+)')
+
+    states = []
+    # 按 "Excited State" 分割（但需要确保只取完整块）
+    blocks = re.split(r'\n(?=\s*Excited\s+State)', content)
+    for block in blocks:
+        lines = block.splitlines()
+        if not lines:
+            continue
+        first_line = lines[0]
+        m = state_pattern.match(first_line)
+        if not m:
+            continue
+        state_num = int(m.group(1))
+        mult_type = m.group(2)
+        energy_eV = float(m.group(3))
+        wavelength_nm = float(m.group(4))
+        osc_strength = float(m.group(5))
+
+        transitions = []
+        for line in lines[1:]:
+            t = trans_pattern.match(line)
+            if t:
+                from_orb = int(t.group(1))
+                to_orb = int(t.group(2))
+                coeff = float(t.group(3))
+                percent = (coeff ** 2) * 100 * 2
+                from_energy = orb_energy_map.get(from_orb, None)
+                to_energy = orb_energy_map.get(to_orb, None)
+                delta_energy = None
+                if from_energy is not None and to_energy is not None:
+                    delta_energy = to_energy - from_energy
+                transitions.append({
+                    'from': from_orb,
+                    'to': to_orb,
+                    'coeff': coeff,
+                    'percent': percent,
+                    'from_energy': from_energy,
+                    'to_energy': to_energy,
+                    'delta_energy': delta_energy,
+                })
+        states.append({
+            'state_num': state_num,
+            'mult_type': mult_type,
+            'energy_eV': energy_eV,
+            'wavelength_nm': wavelength_nm,
+            'osc_strength': osc_strength,
+            'transitions': transitions,
+        })
+    return {'orbital_map': orb_energy_map, 'states': states}
+
+
 # ----------------------------------------------------------------------
 # 图形界面
 # ----------------------------------------------------------------------
 
-class GaussianToolGUI(tk.Tk):
+class GaussianToolGUI(TkinterDnD.Tk):
     def __init__(self):
         super().__init__()
-        self.title("mls V0.0.3-alpha")
+        self.title("mls V26.6.24-alpha")
         self.geometry("850x850")
         self.resizable(True, True)
         atexit.register(self.cleanup_all_temp)
@@ -507,6 +599,8 @@ class GaussianToolGUI(tk.Tk):
         remote_menu.add_command(label="连接服务器", command=self.manage_remote_connection)
         remote_menu.add_separator()
         remote_menu.add_command(label="设置登录头像", command=self.set_avatar)
+
+        remote_menu.add_command(label="FTP 传输窗口", command=self.open_ftp_window)
 
         mode_frame = ttk.LabelFrame(self, text="操作模式", padding=5)
         mode_frame.pack(fill=tk.X, padx=5, pady=5)
@@ -1008,53 +1102,7 @@ class GaussianToolGUI(tk.Tk):
         tree.heading("link_target", text="链接目标")
 
         def refresh_tree():
-            for item in tree.get_children():
-                tree.delete(item)
-            path = current_path.get()
-            try:
-                items = self.sftp.listdir_attr(path)
-
-                def sort_key(attr):
-                    is_dir = (attr.st_mode & 0o040000) != 0
-                    is_link = (attr.st_mode & 0o0120000) == 0o0120000
-                    priority = 0 if is_dir else 1 if is_link else 2
-                    return (priority, attr.filename.lower())
-
-                items.sort(key=sort_key)
-                for attr in items:
-                    name = attr.filename
-                    if name in ('.', '..'):
-                        continue
-                    full = posixpath.join(path, name)
-                    is_link = (attr.st_mode & 0o0120000) == 0o0120000
-                    is_dir = (attr.st_mode & 0o040000) != 0
-                    link_target = ""
-                    if is_link:
-                        try:
-                            link_target = self.sftp.readlink(full)
-                        except:
-                            pass
-                        try:
-                            target_attr = self.sftp.stat(full)
-                            if target_attr.st_mode & 0o040000:
-                                type_str = "目录链接"
-                            else:
-                                type_str = "文件链接"
-                        except:
-                            type_str = "链接"
-                    elif is_dir:
-                        type_str = "目录"
-                    else:
-                        type_str = "文件"
-                    display_text = name
-                    tree.insert("", "end", iid=full, text=display_text,
-                                values=(type_str, link_target),
-                                tags=("link" if is_link else ("dir" if is_dir else "file")))
-                tree.tag_configure("dir", foreground="blue")
-                tree.tag_configure("file", foreground="black")
-                tree.tag_configure("link", foreground="green")
-            except Exception as e:
-                self.log(f"读取远程目录失败: {e}")
+            self._populate_remote_tree(tree, current_path.get())
 
         def go_parent():
             cur = current_path.get()
@@ -1161,6 +1209,67 @@ class GaussianToolGUI(tk.Tk):
         ttk.Button(btn_frame, text="取消", command=dialog.destroy).pack(side=tk.RIGHT)
 
         refresh_tree()
+
+    def _populate_remote_tree(self, tree, path):
+        """
+        通用远程目录填充方法，与 select_remote_folder 中的 refresh_tree 逻辑完全一致。
+        参数:
+            tree: ttk.Treeview 实例
+            path: 要显示的远程路径
+        """
+        for item in tree.get_children():
+            tree.delete(item)
+        if not self.sftp:
+            return
+        try:
+            items = self.sftp.listdir_attr(path)
+
+            def sort_key(attr):
+                is_dir = (attr.st_mode & 0o040000) != 0
+                is_link = (attr.st_mode & 0o0120000) == 0o0120000
+                priority = 0 if is_dir else 1 if is_link else 2
+                return (priority, attr.filename.lower())
+
+            items.sort(key=sort_key)
+            for attr in items:
+                name = attr.filename
+                if name in ('.', '..'):
+                    continue
+                full = posixpath.join(path, name)
+                is_link = (attr.st_mode & 0o0120000) == 0o0120000
+                is_dir = (attr.st_mode & 0o040000) != 0
+                if is_link:
+                    try:
+                        target_attr = self.sftp.stat(full)
+                        if target_attr.st_mode & 0o040000:
+                            type_str = "目录链接"
+                        else:
+                            type_str = "文件链接"
+                    except:
+                        type_str = "链接"
+                    tags = ("link",)
+                    size_str = ""
+                elif is_dir:
+                    type_str = "目录"
+                    tags = ("dir",)
+                    size_str = ""
+                else:
+                    type_str = "文件"
+                    tags = ("file",)
+                    size_str = self._format_size(attr.st_size)  # 需要 _format_size 方法
+                tree.insert("", "end", iid=full, text=name,
+                            values=(type_str, size_str), tags=tags)
+        except Exception as e:
+            self.log(f"刷新远程目录失败: {e}")
+            import traceback
+            self.log(traceback.format_exc())
+
+    def _format_size(self, size):
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size < 1024:
+                return f"{size:.1f} {unit}"
+            size /= 1024
+        return f"{size:.1f} TB"
 
     def download_remote_path(self, remote_url, suffix_filter=None):
         """
@@ -1330,7 +1439,7 @@ class GaussianToolGUI(tk.Tk):
         ttk.Button(status_frame, text="刷新状态", command=self.update_console_status).pack(side=tk.LEFT, padx=5)
 
         # 终端区域
-        terminal_frame = ttk.LabelFrame(self.param_frame, text="终端(伪)", padding=5)
+        terminal_frame = ttk.LabelFrame(self.param_frame, text="终端(伪)   ps:时刻牢记使用英文输入法在终端键入文字", padding=5)
         terminal_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         self.terminal = tk.Text(terminal_frame, wrap=tk.CHAR, bg='#2b2b2b', fg='white',
                                 insertbackground='white', font=('Consolas', 10),
@@ -1359,7 +1468,6 @@ class GaussianToolGUI(tk.Tk):
         ttk.Button(btn_frame, text="启动终端", command=self.start_shell).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="断开终端", command=self.disconnect_shell).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="清屏", command=self.clear_terminal).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="上传文件", command=self.upload_file_to_remote).pack(side=tk.LEFT, padx=5)
         # 初始化变量
         self.shell_channel = None
         self.shell_thread_running = False
@@ -1532,39 +1640,6 @@ class GaussianToolGUI(tk.Tk):
         refresh_tree()
         self.wait_window(dialog)
         return result
-
-    def upload_file_to_remote(self):
-        """上传本地文件到远程服务器（手动选择目标目录）"""
-        if not self.sftp:
-            self.log("请先连接远程服务器")
-            return
-        # 选择本地文件
-        local_path = filedialog.askopenfilename(title="选择要上传的文件")
-        if not local_path:
-            return
-        # 选择远程目录
-        remote_dir = self.choose_remote_directory()
-        if not remote_dir:
-            self.log("未选择远程目录，上传取消")
-            return
-        remote_filename = os.path.basename(local_path)
-        remote_path = posixpath.join(remote_dir, remote_filename)
-        # 确认上传
-        if not tk.messagebox.askyesno(
-                "确认上传",
-                f"本地文件: {os.path.basename(local_path)}\n将上传到: {remote_path}\n\n确定吗？"
-        ):
-            return
-
-        def upload_task():
-            try:
-                self._mkdir_p(remote_dir)
-                self.sftp.put(local_path, remote_path)
-                self.log(f"文件已上传: {local_path} -> {remote_path}")
-            except Exception as e:
-                self.log(f"上传失败: {e}")
-
-        threading.Thread(target=upload_task, daemon=True).start()
 
     def _mkdir_p(self, remote_path):
         """递归创建远程目录"""
@@ -1759,6 +1834,12 @@ class GaussianToolGUI(tk.Tk):
             # 没有选中文本时忽略
             pass
 
+    def open_ftp_window(self):
+        if not self.sftp:
+            self.log("请先连接远程服务器")
+            return
+        ftp_win = FTPWindow(self, self.sftp, self.remote_cwd, self.log)  # 传递 self
+        # ... 原有关闭处理
 
     # ---------- 辅助方法：添加上拉菜单资源预设 ----------
     def add_resource_preset_ui(self, parent, mem_var, nproc_var):
@@ -3036,6 +3117,503 @@ class GaussianToolGUI(tk.Tk):
         except FileNotFoundError:
             self._mkdir_p(posixpath.dirname(remote_path))
             self.sftp.mkdir(remote_path)
+
+
+class FTPWindow(tk.Toplevel):
+    """FTP传输窗口，路径固定为 /home/远程用户名"""
+    def __init__(self, master, sftp, remote_cwd, log_func):
+        super().__init__(master)
+        self.master = master
+        self.sftp = sftp
+        self.log = log_func
+        self.title("FTP 传输")
+        self.geometry("900x650")
+        try:
+            self.iconbitmap(resource_path("md.ico"))
+        except:
+            pass
+
+        self._is_transferring = False
+        self.total_bytes = 0
+        self.transferred_bytes = 0
+        self._current_transferred = 0
+
+        # 主布局
+        paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # ---- 本地 ----
+        left_frame = ttk.LabelFrame(paned, text="本地文件")
+        paned.add(left_frame, weight=1)
+
+        local_control = ttk.Frame(left_frame)
+        local_control.pack(fill=tk.X, padx=5, pady=5)
+        self.local_path_var = tk.StringVar()
+        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+        if os.path.exists(desktop):
+            self.local_path_var.set(desktop)
+        else:
+            home = os.path.expanduser("~")
+            self.local_path_var.set(home if os.path.exists(home) else os.path.abspath(os.sep))
+        ttk.Entry(local_control, textvariable=self.local_path_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+        self.local_refresh_btn = ttk.Button(local_control, text="刷新", command=self.refresh_local)
+        self.local_refresh_btn.pack(side=tk.LEFT, padx=2)
+        self.local_up_btn = ttk.Button(local_control, text="上级", command=self.go_parent_local)
+        self.local_up_btn.pack(side=tk.LEFT, padx=2)
+
+        self.local_tree = self._create_tree(left_frame)
+        self.local_tree.bind("<Double-1>", lambda e: self._on_local_double_click())
+
+        local_btn = ttk.Frame(left_frame)
+        local_btn.pack(fill=tk.X, padx=5, pady=5)
+        self.upload_btn = ttk.Button(local_btn, text="上传选中 →", command=self.ftp_upload)
+        self.upload_btn.pack(side=tk.LEFT, padx=2)
+
+        # ---- 远程 ----
+        right_frame = ttk.LabelFrame(paned, text="远程文件")
+        paned.add(right_frame, weight=1)
+
+        remote_control = ttk.Frame(right_frame)
+        remote_control.pack(fill=tk.X, padx=5, pady=5)
+        self.remote_path_var = tk.StringVar()
+        # 直接设置远程路径为 /home/远程用户名
+        self._init_remote_path()
+        ttk.Entry(remote_control, textvariable=self.remote_path_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+        self.remote_refresh_btn = ttk.Button(remote_control, text="刷新", command=self.refresh_remote)
+        self.remote_refresh_btn.pack(side=tk.LEFT, padx=2)
+        self.remote_up_btn = ttk.Button(remote_control, text="上级", command=self.go_parent_remote)
+        self.remote_up_btn.pack(side=tk.LEFT, padx=2)
+
+        self.remote_tree = self._create_tree(right_frame)
+        self.remote_tree.bind("<Double-1>", lambda e: self._on_remote_double_click())
+
+        remote_btn = ttk.Frame(right_frame)
+        remote_btn.pack(fill=tk.X, padx=5, pady=5)
+        self.download_btn = ttk.Button(remote_btn, text="← 下载选中", command=self.ftp_download)
+        self.download_btn.pack(side=tk.LEFT, padx=2)
+        self.delete_btn = ttk.Button(remote_btn, text="删除选中", command=self.ftp_delete)
+        self.delete_btn.pack(side=tk.LEFT, padx=2)
+
+        # ---- 进度条 ----
+        progress_frame = ttk.Frame(self)
+        progress_frame.pack(fill=tk.X, padx=5, pady=5)
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_var, maximum=100)
+        self.progress_bar.pack(fill=tk.X, expand=True, side=tk.LEFT, padx=(0, 10))
+        self.progress_label = ttk.Label(progress_frame, text="就绪")
+        self.progress_label.pack(side=tk.RIGHT)
+
+        self.refresh_local()
+        self.refresh_remote()
+
+    # ---------- 路径初始化（只使用远程用户名） ----------
+    def _init_remote_path(self):
+        """固定为 /home/远程用户名，若失败则记录错误"""
+        if not self.sftp:
+            self.remote_path_var.set("/")
+            self.log("SFTP 未连接")
+            return
+
+        # 从主窗口获取远程用户名
+        remote_user = getattr(self.master, 'remote_user', None)
+        if not remote_user:
+            self.remote_path_var.set("/")
+            self.log("错误：无法获取远程用户名")
+            return
+
+        home = f"/home/{remote_user}"
+        try:
+            attr = self.sftp.stat(home)
+            if attr.st_mode & 0o040000:
+                self.remote_path_var.set(home)
+                self.log(f"远程路径已设为: {home}")
+                return
+            else:
+                self.remote_path_var.set(home)
+                self.log(f"错误：{home} 存在但不是目录")
+        except FileNotFoundError:
+            self.remote_path_var.set(home)
+            self.log(f"错误：远程主目录 {home} 不存在")
+        except Exception as e:
+            self.remote_path_var.set(home)
+            self.log(f"访问 {home} 失败: {e}")
+
+    # ---------- 辅助方法 ----------
+    def _path_exists(self, path):
+        try:
+            attr = self.sftp.stat(path)
+            return (attr.st_mode & 0o040000) != 0
+        except:
+            return False
+
+    def _mkdir_p(self, remote_path):
+        if remote_path in ("", "/"):
+            return
+        try:
+            self.sftp.stat(remote_path)
+        except FileNotFoundError:
+            self._mkdir_p(posixpath.dirname(remote_path))
+            self.sftp.mkdir(remote_path)
+
+    def _create_tree(self, parent):
+        tree_frame = ttk.Frame(parent)
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        scroll_y = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL)
+        scroll_x = ttk.Scrollbar(tree_frame, orient=tk.HORIZONTAL)
+        tree = ttk.Treeview(tree_frame, columns=("type", "size"), show="tree headings",
+                            yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
+        scroll_y.config(command=tree.yview)
+        scroll_x.config(command=tree.xview)
+        scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+        scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tree.heading("#0", text="名称")
+        tree.heading("type", text="类型")
+        tree.heading("size", text="大小")
+        tree.column("#0", width=250)
+        tree.column("type", width=80)
+        tree.column("size", width=80)
+        tree.tag_configure("dir", foreground="blue")
+        tree.tag_configure("link", foreground="green")
+        tree.tag_configure("file", foreground="black")
+        return tree
+
+    # ---------- 进度条 ----------
+    def _reset_progress(self):
+        self.progress_var.set(0)
+        self.progress_label.config(text="就绪")
+        self.total_bytes = 0
+        self.transferred_bytes = 0
+
+    def _update_progress(self, transferred, total):
+        if total == 0:
+            return
+        percent = (transferred / total) * 100
+        self.progress_var.set(percent)
+        self.progress_label.config(text=f"{transferred / (1024*1024):.1f} MB / {total / (1024*1024):.1f} MB ({percent:.1f}%)")
+        self.update_idletasks()
+
+    def _progress_callback_wrapper(self, transferred, total):
+        delta = transferred - self._current_transferred
+        if delta > 0:
+            self.transferred_bytes += delta
+            self._current_transferred = transferred
+            self.after(0, self._update_progress, self.transferred_bytes, self.total_bytes)
+
+    # ---------- 传输状态 ----------
+    def _set_transferring(self, transferring):
+        self._is_transferring = transferring
+        state = tk.DISABLED if transferring else tk.NORMAL
+        self.upload_btn.config(state=state)
+        self.download_btn.config(state=state)
+        self.delete_btn.config(state=state)
+        self.local_refresh_btn.config(state=state)
+        self.local_up_btn.config(state=state)
+        self.remote_refresh_btn.config(state=state)
+        self.remote_up_btn.config(state=state)
+
+    def _check_and_wait(self):
+        if self._is_transferring:
+            self.log("正在传输或删除中，请等待完成后再操作")
+            return False
+        return True
+
+    # ---------- 刷新 ----------
+    def refresh_local(self):
+        if not self._check_and_wait():
+            return
+        path = self.local_path_var.get()
+        tree = self.local_tree
+        for item in tree.get_children():
+            tree.delete(item)
+        if not os.path.isdir(path):
+            self.log(f"本地路径不存在: {path}")
+            return
+        try:
+            with os.scandir(path) as entries:
+                items = sorted(entries, key=lambda e: (not e.is_dir(), e.name.lower()))
+                for entry in items:
+                    name = entry.name
+                    if entry.is_dir():
+                        type_str = "目录"
+                        size_str = ""
+                        tags = ("dir",)
+                    else:
+                        type_str = "文件"
+                        size_str = self.master._format_size(entry.stat().st_size) if hasattr(self.master, '_format_size') else ""
+                        tags = ("file",)
+                    tree.insert("", "end", text=name, values=(type_str, size_str), tags=tags)
+        except Exception as e:
+            self.log(f"刷新本地失败: {e}")
+
+    def refresh_remote(self):
+        if not self._check_and_wait():
+            return
+        path = self.remote_path_var.get()
+        if not self.sftp:
+            self.log("未连接远程服务器")
+            return
+        if hasattr(self.master, '_populate_remote_tree'):
+            self.master._populate_remote_tree(self.remote_tree, path)
+        else:
+            self.log("错误：主窗口缺少 _populate_remote_tree 方法")
+        self.log(f"远程目录已刷新，共 {len(self.remote_tree.get_children())} 个条目")
+
+    # ---------- 导航 ----------
+    def go_parent_local(self):
+        if not self._check_and_wait():
+            return
+        cur = self.local_path_var.get()
+        parent = os.path.dirname(cur)
+        if parent == "" or parent == cur:
+            parent = os.path.abspath(os.sep)
+        self.local_path_var.set(parent)
+        self.refresh_local()
+
+    def go_parent_remote(self):
+        if not self._check_and_wait():
+            return
+        cur = self.remote_path_var.get()
+        parent = posixpath.dirname(cur)
+        if parent == "":
+            parent = "/"
+        self.remote_path_var.set(parent)
+        self.refresh_remote()
+
+    def _on_local_double_click(self):
+        if self._is_transferring:
+            self.log("正在传输中，请等待完成")
+            return
+        sel = self.local_tree.selection()
+        if not sel:
+            return
+        name = self.local_tree.item(sel[0], "text")
+        full = os.path.join(self.local_path_var.get(), name)
+        if os.path.isdir(full):
+            self.local_path_var.set(full)
+            self.refresh_local()
+
+    def _on_remote_double_click(self):
+        if self._is_transferring:
+            self.log("正在传输中，请等待完成")
+            return
+        sel = self.remote_tree.selection()
+        if not sel:
+            return
+        item = sel[0]
+        values = self.remote_tree.item(item, "values")
+        if not values:
+            return
+        type_str = values[0]
+        if type_str in ("目录", "目录链接"):
+            full = item
+            self.remote_path_var.set(full)
+            self.refresh_remote()
+
+    # ---------- 大小计算 ----------
+    def _get_local_size(self, path):
+        if os.path.isfile(path):
+            return os.path.getsize(path)
+        elif os.path.isdir(path):
+            total = 0
+            for root, dirs, files in os.walk(path):
+                for f in files:
+                    fp = os.path.join(root, f)
+                    total += os.path.getsize(fp)
+            return total
+        return 0
+
+    def _get_remote_size(self, path):
+        try:
+            attr = self.sftp.stat(path)
+            if attr.st_mode & 0o040000:
+                total = 0
+                for item in self.sftp.listdir_attr(path):
+                    if item.filename in ('.', '..'):
+                        continue
+                    sub_path = posixpath.join(path, item.filename)
+                    total += self._get_remote_size(sub_path)
+                return total
+            else:
+                return attr.st_size
+        except:
+            return 0
+
+    # ---------- 上传 ----------
+    def ftp_upload(self):
+        if self._is_transferring:
+            self.log("已有传输任务正在进行")
+            return
+        items = self.local_tree.selection()
+        if not items:
+            self.log("请先选择本地文件或文件夹")
+            return
+        remote_root = self.remote_path_var.get()
+        local_dir = self.local_path_var.get()
+
+        selected = [self.local_tree.item(item, "text") for item in items]
+        total_bytes = 0
+        for name in selected:
+            local_path = os.path.join(local_dir, name)
+            total_bytes += self._get_local_size(local_path)
+        if total_bytes == 0:
+            self.log("所选文件总大小为 0，无法显示进度")
+            return
+
+        self.total_bytes = total_bytes
+        self.transferred_bytes = 0
+        self.progress_var.set(0)
+        self.progress_label.config(text="准备上传...")
+        self._set_transferring(True)
+
+        def upload_all():
+            try:
+                for name in selected:
+                    local_path = os.path.join(local_dir, name)
+                    remote_path = posixpath.join(remote_root, name)
+                    try:
+                        if os.path.isdir(local_path):
+                            self._upload_dir_with_progress(local_path, remote_path)
+                        else:
+                            self._mkdir_p(posixpath.dirname(remote_path))
+                            self._current_transferred = 0
+                            self.sftp.put(local_path, remote_path, callback=self._progress_callback_wrapper)
+                        self.log(f"上传成功: {local_path} -> {remote_path}")
+                    except Exception as e:
+                        self.log(f"上传失败 {name}: {e}")
+            finally:
+                self.after(0, self._on_transfer_done)
+
+        threading.Thread(target=upload_all, daemon=True).start()
+
+    def _upload_dir_with_progress(self, local_dir, remote_dir):
+        self._mkdir_p(remote_dir)
+        for entry in os.scandir(local_dir):
+            local = entry.path
+            remote = posixpath.join(remote_dir, entry.name)
+            if entry.is_dir():
+                self._upload_dir_with_progress(local, remote)
+            else:
+                self._current_transferred = 0
+                self.sftp.put(local, remote, callback=self._progress_callback_wrapper)
+
+    # ---------- 下载 ----------
+    def ftp_download(self):
+        if self._is_transferring:
+            self.log("已有传输任务正在进行")
+            return
+        items = self.remote_tree.selection()
+        if not items:
+            self.log("请先选择远程文件或文件夹")
+            return
+        local_root = self.local_path_var.get()
+
+        selected = [(self.remote_tree.item(item, "text"), item) for item in items]
+        total_bytes = 0
+        for name, remote_path in selected:
+            total_bytes += self._get_remote_size(remote_path)
+        if total_bytes == 0:
+            self.log("所选文件总大小为 0，无法显示进度")
+            return
+
+        self.total_bytes = total_bytes
+        self.transferred_bytes = 0
+        self.progress_var.set(0)
+        self.progress_label.config(text="准备下载...")
+        self._set_transferring(True)
+
+        def download_all():
+            try:
+                for name, remote_path in selected:
+                    local_path = os.path.join(local_root, name)
+                    try:
+                        attr = self.sftp.stat(remote_path)
+                        if attr.st_mode & 0o040000:
+                            self._download_dir_with_progress(remote_path, local_path)
+                        else:
+                            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                            self._current_transferred = 0
+                            self.sftp.get(remote_path, local_path, callback=self._progress_callback_wrapper)
+                        self.log(f"下载成功: {remote_path} -> {local_path}")
+                    except Exception as e:
+                        self.log(f"下载失败 {name}: {e}")
+            finally:
+                self.after(0, self._on_transfer_done)
+
+        threading.Thread(target=download_all, daemon=True).start()
+
+    def _download_dir_with_progress(self, remote_dir, local_dir):
+        os.makedirs(local_dir, exist_ok=True)
+        for attr in self.sftp.listdir_attr(remote_dir):
+            if attr.filename in ('.', '..'):
+                continue
+            remote = posixpath.join(remote_dir, attr.filename)
+            local = os.path.join(local_dir, attr.filename)
+            if attr.st_mode & 0o040000:
+                self._download_dir_with_progress(remote, local)
+            else:
+                self._current_transferred = 0
+                self.sftp.get(remote, local, callback=self._progress_callback_wrapper)
+
+    # ---------- 删除 ----------
+    def ftp_delete(self):
+        if self._is_transferring:
+            self.log("已有传输任务正在进行")
+            return
+        items = self.remote_tree.selection()
+        if not items:
+            self.log("请先选择远程文件或文件夹")
+            return
+
+        selected_info = []
+        for item in items:
+            name = self.remote_tree.item(item, "text")
+            path = item
+            selected_info.append((name, path))
+
+        names = [info[0] for info in selected_info]
+        msg = f"确定要永久删除以下 {len(names)} 个项目吗？\n\n" + "\n".join(names) + "\n\n此操作不可恢复！"
+        if not tk.messagebox.askyesno("确认删除", msg):
+            return
+
+        self._set_transferring(True)
+        self.progress_var.set(0)
+        self.progress_label.config(text="删除中...")
+
+        def delete_all():
+            try:
+                for name, remote_path in selected_info:
+                    try:
+                        self._delete_remote_path(remote_path)
+                        self.log(f"删除成功: {remote_path}")
+                    except Exception as e:
+                        self.log(f"删除失败 {name}: {e}")
+            finally:
+                self.after(0, self._on_transfer_done)
+
+        threading.Thread(target=delete_all, daemon=True).start()
+
+    def _delete_remote_path(self, remote_path):
+        attr = self.sftp.stat(remote_path)
+        if attr.st_mode & 0o040000:
+            for item in self.sftp.listdir_attr(remote_path):
+                if item.filename in ('.', '..'):
+                    continue
+                sub_path = posixpath.join(remote_path, item.filename)
+                self._delete_remote_path(sub_path)
+            self.sftp.rmdir(remote_path)
+        else:
+            self.sftp.remove(remote_path)
+
+    # ---------- 传输完成 ----------
+    def _on_transfer_done(self):
+        self._set_transferring(False)
+        self.progress_var.set(100)
+        self.progress_label.config(text="完成")
+        self.log("所有传输/删除任务已完成")
+        self.refresh_remote()
+        self.refresh_local()
+        self.after(2000, self._reset_progress)
 
 
 if __name__ == "__main__":
