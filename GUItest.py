@@ -390,7 +390,7 @@ def extract_modredundant_scan_steps(lines):
                 last_std_orient_atoms = atoms
                 last_std_orient_coords = coords
 
-        if 'Optimization completed.' in line:
+        if 'Optimization completed' in line:
             if last_std_orient_atoms is not None:
                 converged_atoms = last_std_orient_atoms
                 converged_coords = last_std_orient_coords
