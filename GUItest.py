@@ -21,6 +21,8 @@ from pathlib import Path
 import atexit
 from PIL import Image, ImageTk, ImageSequence
 from tkinterdnd2 import TkinterDnD, DND_FILES
+import numpy as np
+import pandas as pd
 
 # ----------------------------------------------------------------------
 # 公用函数
@@ -402,90 +404,6 @@ def extract_modredundant_scan_steps(lines):
     return steps
 
 
-def parse_td_data0(log_path):
-    """
-    解析高斯log文件中的TD激发态信息，并获取轨道能量。
-    返回字典，包含轨道能量映射和激发态列表。
-    """
-    # 首先获取轨道能量（复用现有函数）
-    orbital_data = parse_orbital_energies_advanced(log_path)
-    # 构建全局轨道序号 -> 能量(Ha) 的映射
-    orb_energy_map = {}
-    # Alpha 占据 (idx, eng)
-    for idx, eng in orbital_data.get('alpha_occ', []):
-        orb_energy_map[idx] = eng
-    # Alpha 虚
-    for idx, eng in orbital_data.get('alpha_virt', []):
-        orb_energy_map[idx] = eng
-    # Beta 占据
-    for idx, eng in orbital_data.get('beta_occ', []):
-        orb_energy_map[idx] = eng
-    # Beta 虚
-    for idx, eng in orbital_data.get('beta_virt', []):
-        orb_energy_map[idx] = eng
-
-    with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
-        content = f.read()
-
-    # 正则表达式匹配激发态块
-    state_pattern = re.compile(
-        r'^\s*Excited\s+State\s+(\d+):\s+(\S+)\s+([\d\.]+)\s+eV\s+([\d\.]+)\s+nm\s+f=([\d\.Ee+-]+)',
-        re.M
-    )
-    # 匹配跃迁行: "     40 -> 41       0.66499" 或 "     39 -> 41      -0.15291"
-    trans_pattern = re.compile(r'^\s*(\d+)\s*->\s*(\d+)\s+([-+]?[\d\.Ee+-]+)')
-
-    states = []
-    # 按激发态分割内容：每个激发态从"Excited State"开始，直到下一个"Excited State"或文件结束
-    blocks = re.split(r'\n(?=\s*Excited\s+State)', content)
-    for block in blocks[1:]:  # 第一个块是空或无用
-        lines = block.splitlines()
-        if not lines:
-            continue
-        first_line = lines[0]
-        m = state_pattern.match(first_line)
-        if not m:
-            continue
-        state_num = int(m.group(1))
-        mult_type = m.group(2)  # 如 Singlet-A, Triplet-A
-        energy_eV = float(m.group(3))
-        wavelength_nm = float(m.group(4))
-        osc_strength = float(m.group(5))
-
-        # 解析跃迁
-        transitions = []
-        for line in lines[1:]:
-            t = trans_pattern.match(line)
-            if t:
-                from_orb = int(t.group(1))
-                to_orb = int(t.group(2))
-                coeff = float(t.group(3))
-                percent = (coeff ** 2) * 100 * 2
-                from_energy = orb_energy_map.get(from_orb, None)
-                to_energy = orb_energy_map.get(to_orb, None)
-                delta_energy = None
-                if from_energy is not None and to_energy is not None:
-                    delta_energy = to_energy - from_energy
-                transitions.append({
-                    'from': from_orb,
-                    'to': to_orb,
-                    'coeff': coeff,
-                    'percent': percent,
-                    'from_energy': from_energy,
-                    'to_energy': to_energy,
-                    'delta_energy': delta_energy,
-                })
-        states.append({
-            'state_num': state_num,
-            'mult_type': mult_type,
-            'energy_eV': energy_eV,
-            'wavelength_nm': wavelength_nm,
-            'osc_strength': osc_strength,
-            'transitions': transitions,
-        })
-    return {'orbital_map': orb_energy_map, 'states': states}
-
-
 def parse_td_data(log_path):
     """
     解析高斯log文件中的TD激发态信息，并获取轨道能量。
@@ -577,6 +495,78 @@ def parse_td_data(log_path):
     return {'orbital_map': orb_energy_map, 'states': states}
 
 
+def parse_soc_ms_matrix(filename):
+    """
+    从 ORCA 输出中提取 MS=0, -1, +1 的 SOC 矩阵元（每个 (Re, Im)），
+    返回字典 {(T_index, S_index): total_SOC}，S_index 从 0 开始。
+    """
+    with open(filename, 'r', encoding='utf-8') as f:
+        text = f.read()
+
+    # 匹配数据行：T  S  (Re, Im)  (Re, Im)  (Re, Im)
+    pattern = r'(\d+)\s+(\d+)\s+\(\s*([-+]?\d+\.\d+)\s*,\s*([-+]?\d+\.\d+)\s*\)\s+\(\s*([-+]?\d+\.\d+)\s*,\s*([-+]?\d+\.\d+)\s*\)\s+\(\s*([-+]?\d+\.\d+)\s*,\s*([-+]?\d+\.\d+)\s*\)'
+
+    matches = re.findall(pattern, text)
+    data = {}
+    for match in matches:
+        t = int(match[0])
+        s = int(match[1])
+        vals = [float(x) for x in match[2:]]
+        total = np.sqrt(sum(v ** 2 for v in vals))
+        data[(t, s)] = total
+    return data
+
+
+def build_dataframe(data, label=""):
+    """
+    构建动态大小的 DataFrame，行 T1–Tmax，列 S0–Smax
+    """
+    if not data:
+        return pd.DataFrame()
+    t_indices = [t for t, _ in data.keys()]
+    s_indices = [s for _, s in data.keys()]
+    max_t = max(t_indices) if t_indices else 0
+    max_s = max(s_indices) if s_indices else 0
+
+    rows = []
+    for t in range(1, max_t + 1):
+        row = []
+        for s in range(0, max_s + 1):
+            row.append(data.get((t, s), 0.0))
+        rows.append(row)
+
+    df = pd.DataFrame(rows,
+                      index=[f'T{i}' for i in range(1, max_t + 1)],
+                      columns=[f'S{i}' for i in range(0, max_s + 1)])
+    return df
+
+
+def _copy_soc_row(self, tree, row_id):
+    """复制整行（制表符分隔）"""
+    if not row_id:
+        return
+    item = tree.item(row_id)
+    values = item['values']
+    line = "\t".join(str(v) for v in values)
+    self.clipboard_clear()
+    self.clipboard_append(line)
+    self.log(f"已复制行: {line[:50]}...")
+
+
+def _copy_soc_matrix(self, tree):
+    """复制整个矩阵（制表符分隔）"""
+    # 获取表头
+    columns = tree['columns']  # 列表，如 ['T1', 'S0', ...]
+    lines = ["\t".join(columns)]
+    for child in tree.get_children():
+        values = tree.item(child)['values']
+        lines.append("\t".join(str(v) for v in values))
+    text = "\n".join(lines)
+    self.clipboard_clear()
+    self.clipboard_append(text)
+    self.log("已复制整个矩阵到剪贴板")
+
+
 # ----------------------------------------------------------------------
 # 图形界面
 # ----------------------------------------------------------------------
@@ -585,7 +575,7 @@ class GaussianToolGUI(TkinterDnD.Tk):
     def __init__(self):
         super().__init__()
         self.title("mls V26.8-Alpha")
-        self.geometry("950x850")
+        self.geometry("850x900")
         self.resizable(True, True)
         atexit.register(self.cleanup_all_temp)
         # 添加菜单栏
@@ -627,11 +617,23 @@ class GaussianToolGUI(TkinterDnD.Tk):
             ("批量提取轨道能量", "batch_orbital"),
             ("提取TD信息", "extract_td"),
             ("服务器控制台", "console"),
+            ("提取SOC数据", "extract_soc"),
             ("重组能计算", "reorganization_energy")
         ]
-        for text, value in modes:
-            ttk.Radiobutton(mode_frame, text=text, variable=self.mode_var,
-                            value=value, command=self.on_mode_change).pack(side=tk.LEFT, padx=10)
+        # for text, value in modes:
+        #     ttk.Radiobutton(mode_frame, text=text, variable=self.mode_var,
+        #                     value=value, command=self.on_mode_change).pack(side=tk.LEFT, padx=10)
+        cols = 4  # 每行 4 个
+        for i, (text, value) in enumerate(modes):
+            row = i // cols
+            col = i % cols
+            rb = ttk.Radiobutton(mode_frame, text=text, variable=self.mode_var,
+                                 value=value, command=self.on_mode_change)
+            rb.grid(row=row, column=col, padx=10, pady=2, sticky=tk.W)
+
+        # 可选：设置列权重使各列均匀分布
+        for col in range(cols):
+            mode_frame.grid_columnconfigure(col, weight=1)
 
         self.servers_config_file = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "gaussian_servers.ini")
 
@@ -785,11 +787,13 @@ class GaussianToolGUI(TkinterDnD.Tk):
             self.create_console_widgets()
         elif mode == "reorganization_energy":
             self.create_reorg_widgets()
+        elif mode == "extract_soc":
+            self.create_extract_soc_widgets()
         else:
             self.create_extract_scan_widgets()
 
         # 根据模式显示或隐藏运行按钮
-        if mode in ["batch_orbital", "extract_td", "console"]:
+        if mode in ["batch_orbital", "extract_td", "console", "reorganization_energy"]:
             self.run_btn.pack_forget()
         else:
             if not self.run_btn.winfo_ismapped():
@@ -1522,7 +1526,7 @@ class GaussianToolGUI(TkinterDnD.Tk):
             self.update_console_status()
 
     def choose_remote_directory(self):
-        """弹出一个仅选择远程目录的对话框，支持进入目录链接，返回远程路径（绝对路径），取消则返回 None"""
+        """弹出一个仅选择远程目录的对话框，支持新建文件夹，返回远程路径（绝对路径），取消则返回 None"""
         if not self.sftp:
             self.log("请先连接远程服务器")
             return None
@@ -1536,7 +1540,6 @@ class GaussianToolGUI(TkinterDnD.Tk):
         except:
             pass
 
-        # 当前路径（默认 home）
         default_path = f"/home/{self.remote_user}"
         try:
             self.sftp.stat(default_path)
@@ -1544,7 +1547,7 @@ class GaussianToolGUI(TkinterDnD.Tk):
             default_path = "/"
         current_path = tk.StringVar(value=default_path)
 
-        # 顶部路径栏
+        # ---- 顶部路径栏（含新建文件夹按钮） ----
         path_frame = ttk.Frame(dialog)
         path_frame.pack(fill=tk.X, padx=5, pady=5)
         ttk.Label(path_frame, text="路径:").pack(side=tk.LEFT)
@@ -1553,7 +1556,25 @@ class GaussianToolGUI(TkinterDnD.Tk):
         ttk.Button(path_frame, text="刷新", command=lambda: refresh_tree()).pack(side=tk.LEFT)
         ttk.Button(path_frame, text="上级", command=lambda: go_parent()).pack(side=tk.LEFT)
 
-        # 文件树
+        def new_folder():
+            name = tk.simpledialog.askstring("新建文件夹", "请输入文件夹名称:", parent=dialog)
+            if not name or not name.strip():
+                return
+            name = name.strip()
+            if '/' in name or '\\' in name:
+                self.log("文件夹名称不能包含路径分隔符")
+                return
+            new_path = posixpath.join(current_path.get(), name)
+            try:
+                self.sftp.mkdir(new_path)
+                self.log(f"已创建远程目录: {new_path}")
+                refresh_tree()
+            except Exception as e:
+                self.log(f"创建文件夹失败: {e}")
+
+        ttk.Button(path_frame, text="新建文件夹", command=new_folder).pack(side=tk.LEFT, padx=5)
+
+        # ---- 文件树 ----
         tree_frame = ttk.Frame(dialog)
         tree_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         scroll_y = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL)
@@ -1573,7 +1594,6 @@ class GaussianToolGUI(TkinterDnD.Tk):
             try:
                 items = self.sftp.listdir_attr(path)
 
-                # 排序：目录优先，链接其次
                 def sort_key(attr):
                     is_dir = (attr.st_mode & 0o040000) != 0
                     is_link = (attr.st_mode & 0o0120000) == 0o0120000
@@ -1590,9 +1610,8 @@ class GaussianToolGUI(TkinterDnD.Tk):
                     is_dir = (attr.st_mode & 0o040000) != 0
                     type_str = ""
                     if is_link:
-                        # 检查链接目标是否为目录
                         try:
-                            target_attr = self.sftp.stat(full)  # stat 解析链接
+                            target_attr = self.sftp.stat(full)
                             if target_attr.st_mode & 0o040000:
                                 type_str = "目录链接"
                             else:
@@ -1603,11 +1622,8 @@ class GaussianToolGUI(TkinterDnD.Tk):
                         type_str = "目录"
                     else:
                         type_str = "文件"
-                    # 只显示目录和目录链接（因为我们要选择目录）
                     if type_str in ("目录", "目录链接"):
                         tree.insert("", "end", iid=full, text=name, values=(type_str,))
-                tree.tag_configure("dir", foreground="blue")
-                tree.tag_configure("link", foreground="green")
             except Exception as e:
                 self.log(f"读取目录失败: {e}")
 
@@ -3119,28 +3135,20 @@ class GaussianToolGUI(TkinterDnD.Tk):
                 except Exception as e:
                     self.log(f"上传 {local_file} 失败: {e}")
 
-    def _mkdir_p(self, remote_path):
-        """递归创建远程目录"""
-        if remote_path == "/" or remote_path == "":
-            return
-        try:
-            self.sftp.stat(remote_path)
-        except FileNotFoundError:
-            self._mkdir_p(posixpath.dirname(remote_path))
-            self.sftp.mkdir(remote_path)
-
     # ---------- 重组能计算模式 ----------
     def create_reorg_widgets(self):
-        """重组能计算界面：支持本地上传或远程已有文件"""
+        """重组能计算界面：支持本地上传或远程已有文件，并新增高级选项（跳过步骤/禁用IC）"""
         row = 0
 
         # 文件来源选择
-        source_frame = ttk.LabelFrame(self.param_frame, text="输入文件来源(注：目前仅Tomori安装了nomap，其他服务器若要安装请联系开发人员)", padding=5)
+        source_frame = ttk.LabelFrame(self.param_frame,
+                                      text="输入文件来源(注：目前仅Tomori安装了nomap，若要使用其他服务器请联系开发人员)",
+                                      padding=5)
         source_frame.grid(row=row, column=0, columnspan=3, sticky="ew", padx=5, pady=5)
         self.current_widgets.append(source_frame)
 
         self.reorg_source_var = tk.StringVar(value="local")
-        self.reorg_local_frame = ttk.Frame(source_frame)  # 用于存放本地输入控件
+        self.reorg_local_frame = ttk.Frame(source_frame)
         self.reorg_remote_frame = ttk.Frame(source_frame)
 
         rb_local = ttk.Radiobutton(source_frame, text="本地文件 (上传)", variable=self.reorg_source_var,
@@ -3150,27 +3158,32 @@ class GaussianToolGUI(TkinterDnD.Tk):
                                     value="remote", command=self._toggle_reorg_input)
         rb_remote.pack(side=tk.LEFT, padx=10)
 
-        # 本地文件输入（放在 self.reorg_local_frame 中）
+        # 本地文件输入
         self.reorg_local_file_var = tk.StringVar()
         ttk.Label(self.reorg_local_frame, text="本地 .gjf 文件:").pack(side=tk.LEFT)
         entry_local = ttk.Entry(self.reorg_local_frame, textvariable=self.reorg_local_file_var, width=40)
         entry_local.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        ttk.Button(self.reorg_local_frame, text="浏览",
-                   command=lambda: self.select_file(self.reorg_local_file_var)).pack(
-            side=tk.LEFT)
+        btn_local = ttk.Button(self.reorg_local_frame, text="浏览",
+                               command=lambda: self.select_file(self.reorg_local_file_var))
+        btn_local.pack(side=tk.LEFT)
 
-        # 远程文件输入（放在 self.reorg_remote_frame 中）
+        # 远程文件输入
         self.reorg_remote_file_var = tk.StringVar()
         ttk.Label(self.reorg_remote_frame, text="远程 .gjf 文件:").pack(side=tk.LEFT)
         entry_remote = ttk.Entry(self.reorg_remote_frame, textvariable=self.reorg_remote_file_var, width=40)
         entry_remote.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        ttk.Button(self.reorg_remote_frame, text="浏览",
-                   command=lambda: self.select_remote_folder(self.reorg_remote_file_var)).pack(side=tk.LEFT)
+        btn_remote = ttk.Button(self.reorg_remote_frame, text="浏览",
+                                command=lambda: self.select_remote_folder(self.reorg_remote_file_var))
+        btn_remote.pack(side=tk.LEFT)
 
         # 将两个框架放置到 source_frame 中（默认显示 local）
         self.reorg_local_frame.pack(fill=tk.X, expand=True, pady=2)
         self.reorg_remote_frame.pack(fill=tk.X, expand=True, pady=2)
-        self.reorg_remote_frame.pack_forget()  # 默认隐藏
+        self.reorg_remote_frame.pack_forget()
+
+        # 收集所有与 gjf 输入相关的控件，以便后续禁用
+        self.reorg_gjf_widgets = [rb_local, rb_remote, entry_local, entry_remote, btn_local, btn_remote,
+                                  self.reorg_local_frame, self.reorg_remote_frame]
 
         row += 1
 
@@ -3182,7 +3195,7 @@ class GaussianToolGUI(TkinterDnD.Tk):
         ttk.Button(self.param_frame, text="浏览", command=self._browse_workdir).grid(row=row, column=2, padx=2)
         row += 1
 
-        # 可选参数（同上）
+        # 可选参数
         param_frame = ttk.LabelFrame(self.param_frame, text="可选参数 (留空使用默认值)", padding=5)
         param_frame.grid(row=row, column=0, columnspan=3, sticky="ew", padx=5, pady=5)
         self.current_widgets.append(param_frame)
@@ -3198,19 +3211,82 @@ class GaussianToolGUI(TkinterDnD.Tk):
         }
 
         param_labels = [
-            ("g (Gaussian泛函)", "g"),
-            ("o (ORCA方法)", "o"),
-            ("gb (Gaussian基组)", "gb"),
-            ("ob (ORCA基组)", "ob"),
+            ("g (Gaussian 泛函)", "g"),
+            ("o (ORCA 泛函)", "o"),
+            ("gb (Gaussian 基组)", "gb"),
+            ("ob (ORCA 基组)", "ob"),
             ("root (IROOT)", "root"),
             ("sm (自旋多重度)", "sm"),
             ("c (电荷)", "c"),
         ]
+        cols_per_row = 2
         for i, (label_text, key) in enumerate(param_labels):
-            ttk.Label(param_frame, text=label_text).grid(row=i, column=0, sticky=tk.W, padx=5, pady=2)
+            row_p = i // cols_per_row
+            col = (i % cols_per_row) * 2
+            ttk.Label(param_frame, text=label_text).grid(row=row_p, column=col, sticky=tk.W, padx=5, pady=2)
             entry = ttk.Entry(param_frame, textvariable=self.reorg_params[key], width=20)
-            entry.grid(row=i, column=1, padx=5, pady=2, sticky=tk.W)
+            entry.grid(row=row_p, column=col + 1, padx=5, pady=2, sticky=tk.W)
+
+        for col in range(4):
+            param_frame.grid_columnconfigure(col, weight=1, uniform="param")
+
+        param_rows = (len(param_labels) + 1) // 2
+        row = param_rows
+
+        # ---------- 高级选项 ----------
+        adv_frame = ttk.LabelFrame(self.param_frame, text="高级选项", padding=5)
+        adv_frame.grid(row=row, column=0, columnspan=3, sticky="ew", padx=5, pady=5)
+        self.current_widgets.append(adv_frame)
         row += 1
+
+        # 跳过 step1 (state1)
+        self.reorg_skip_step1 = tk.BooleanVar(value=False)
+        cb1 = ttk.Checkbutton(adv_frame, text="基态频率文件 (使用外部 fchk)", variable=self.reorg_skip_step1,
+                              command=self._toggle_reorg_state1)
+        cb1.grid(row=0, column=0, columnspan=3, sticky=tk.W, padx=5, pady=2)
+
+        self.reorg_state1_var = tk.StringVar()
+        state1_frame = ttk.Frame(adv_frame)
+        state1_frame.grid(row=1, column=0, columnspan=3, sticky="ew", padx=20, pady=2)
+        state1_frame.grid_remove()  # 初始隐藏
+        ttk.Label(state1_frame, text="state 1 远程路径(.fchk):").pack(side=tk.LEFT)
+        self._state1_entry = ttk.Entry(state1_frame, textvariable=self.reorg_state1_var, width=40, state='disabled')
+        self._state1_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Button(state1_frame, text="远程浏览",
+                   command=lambda: self._browse_remote_fchk(self.reorg_state1_var)).pack(side=tk.LEFT)
+
+        # 跳过 step3 (state2)
+        self.reorg_skip_step3 = tk.BooleanVar(value=False)
+        cb2 = ttk.Checkbutton(adv_frame, text="激发态频率文件 (使用外部 fchk)", variable=self.reorg_skip_step3,
+                              command=self._toggle_reorg_state2)
+        cb2.grid(row=2, column=0, columnspan=3, sticky=tk.W, padx=5, pady=2)
+
+        self.reorg_state2_var = tk.StringVar()
+        state2_frame = ttk.Frame(adv_frame)
+        state2_frame.grid(row=3, column=0, columnspan=3, sticky="ew", padx=20, pady=2)
+        state2_frame.grid_remove()  # 初始隐藏
+        ttk.Label(state2_frame, text="state 2 远程路径(.fchk)").pack(side=tk.LEFT)
+        self._state2_entry = ttk.Entry(state2_frame, textvariable=self.reorg_state2_var, width=40, state='disabled')
+        self._state2_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Button(state2_frame, text="远程浏览",
+                   command=lambda: self._browse_remote_fchk(self.reorg_state2_var)).pack(side=tk.LEFT)
+
+        # 启用 IC —— 默认不勾选（即禁用IC）
+        self.reorg_ic_enabled = tk.BooleanVar(value=False)
+        cb3 = ttk.Checkbutton(adv_frame, text="启用 IC 计算", variable=self.reorg_ic_enabled,
+                              onvalue=True, offvalue=False)
+        cb3.grid(row=4, column=0, columnspan=3, sticky=tk.W, padx=5, pady=2)
+
+        # ---- 任务名输入（仅在 state1 勾选时显示） ----
+        self.reorg_task_name_frame = ttk.Frame(adv_frame)
+        self.reorg_task_name_frame.grid(row=5, column=0, columnspan=3, sticky="ew", padx=20, pady=2)
+        self.reorg_task_name_frame.grid_remove()  # 初始隐藏
+        ttk.Label(self.reorg_task_name_frame, text="任务名:").pack(side=tk.LEFT)
+        self.reorg_task_name_var = tk.StringVar()
+        self.reorg_task_name_entry = ttk.Entry(self.reorg_task_name_frame, textvariable=self.reorg_task_name_var,
+                                               width=30)
+        self.reorg_task_name_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        self.reorg_task_name_entry.config(state='disabled')
 
         # 提交按钮
         btn_frame = ttk.Frame(self.param_frame)
@@ -3238,8 +3314,62 @@ class GaussianToolGUI(TkinterDnD.Tk):
         if dir_path:
             self.reorg_workdir_var.set(dir_path)
 
+    def _toggle_reorg_state1(self):
+        """切换 state1 输入框状态，同时控制 gjf 输入区域和任务名输入"""
+        enable = self.reorg_skip_step1.get()
+        # 控制 state1 输入框
+        state = tk.NORMAL if enable else tk.DISABLED
+        self._state1_entry.config(state=state)
+        if not enable:
+            self.reorg_state1_var.set("")
+        # 显示/隐藏 state1 框架
+        if enable:
+            self._state1_entry.master.grid()
+        else:
+            self._state1_entry.master.grid_remove()
+
+        # 控制 gjf 输入区域（禁用/启用）
+        gjf_state = tk.DISABLED if enable else tk.NORMAL
+        for widget in self.reorg_gjf_widgets:
+            try:
+                widget.config(state=gjf_state)
+            except tk.TclError:
+                pass
+
+        # 控制任务名输入框
+        if enable:
+            self.reorg_task_name_frame.grid()  # 显示
+            self.reorg_task_name_entry.config(state='normal')
+            # 不再自动填充，保持用户输入或为空
+        else:
+            self.reorg_task_name_entry.config(state='disabled')
+            self.reorg_task_name_frame.grid_remove()
+            self.reorg_task_name_var.set("")  # 清空
+
+    def _toggle_reorg_state2(self):
+        """切换 state2 输入框状态，并显示/隐藏相应框架"""
+        enable = self.reorg_skip_step3.get()
+        state = tk.NORMAL if enable else tk.DISABLED
+        self._state2_entry.config(state=state)
+        if not enable:
+            self.reorg_state2_var.set("")
+        # 显示/隐藏 state2 框架
+        if enable:
+            self._state2_entry.master.grid()  # master 是 state2_frame
+        else:
+            self._state2_entry.master.grid_remove()
+
+    def _browse_remote_fchk(self, var):
+        """通过远程浏览选择 .fchk 文件，将 ssh:// 路径存入 var"""
+        if not self.sftp:
+            self.log("请先连接远程服务器")
+            return
+        # 调用已有的远程选择对话框（目录或文件均可）
+        self.select_remote_folder(var)
+        # 如果 var 的值以 ssh:// 开头，则已设置；否则可能为空或无效
+
     def submit_reorg_job(self):
-        """提交重组能计算任务"""
+        """提交重组能计算任务，支持新增的 state1/state2/IC=off 参数"""
         # 检查连接
         if not self.ssh_client or not self.sftp:
             self.log("错误：尚未连接远程服务器，请先通过「远程服务器」菜单连接。")
@@ -3260,72 +3390,98 @@ class GaussianToolGUI(TkinterDnD.Tk):
             return
 
         source = self.reorg_source_var.get()
-        remote_filename = None
+        use_state1 = self.reorg_skip_step1.get()
 
-        if source == "local":
-            local_path = self.reorg_local_file_var.get().strip()
-            if not local_path or not os.path.isfile(local_path):
-                self.log("请选择有效的本地 .gjf 文件")
+        # ----- 处理输入文件（.gjf）或任务名 -----
+        if use_state1:
+            # 使用外部 fchk，无需 gjf 文件，必须用户自行填写任务名
+            task_name = self.reorg_task_name_var.get().strip()
+            if not task_name:
+                self.log("错误：使用外部基态频率文件时，必须手动填写任务名（自定义）")
                 return
-            remote_filename = os.path.basename(local_path)
-            remote_file_path = posixpath.join(workdir, remote_filename)
-            # 检查是否存在
-            try:
-                self.sftp.stat(remote_file_path)
-                if not tk.messagebox.askyesno("文件已存在", f"远程文件 {remote_file_path} 已存在，是否覆盖？"):
-                    self.log("操作取消")
-                    return
-            except FileNotFoundError:
-                pass
-            self.log(f"上传文件 {local_path} -> {remote_file_path}")
-            try:
-                self.sftp.put(local_path, remote_file_path)
-            except Exception as e:
-                self.log(f"上传失败: {e}")
+
+            # 确保 state1 路径有效
+            state1_path = self.reorg_state1_var.get().strip()
+            if not state1_path:
+                self.log("勾选了基态频率文件，但未提供 state1.fchk 路径")
                 return
-        else:  # remote
-            remote_url = self.reorg_remote_file_var.get().strip()
-            if not remote_url:
-                self.log("请选择远程 .gjf 文件")
-                return
-            # 解析 ssh:// 路径
-            if remote_url.startswith("ssh://"):
-                parsed = urllib.parse.urlparse(remote_url)
-                remote_path = parsed.path
+            if state1_path.startswith("ssh://"):
+                parsed = urllib.parse.urlparse(state1_path)
+                state1_remote = parsed.path
             else:
-                remote_path = remote_url
+                state1_remote = state1_path
             try:
-                self.sftp.stat(remote_path)
+                self.sftp.stat(state1_remote)
             except FileNotFoundError:
-                self.log(f"远程文件不存在: {remote_path}")
+                self.log(f"远程 state1 文件不存在: {state1_remote}")
                 return
-            except Exception as e:
-                self.log(f"检查远程文件失败: {e}")
-                return
-            remote_filename = os.path.basename(remote_path)
-            # 若文件不在工作目录，则复制
-            if posixpath.dirname(remote_path) != workdir:
-                target_path = posixpath.join(workdir, remote_filename)
+
+            remote_file_arg = task_name
+            self.log(f"使用外部基态频率文件，任务名: {task_name}")
+        else:
+            # 原有逻辑：需要 .gjf 文件
+            remote_filename = None
+            if source == "local":
+                local_path = self.reorg_local_file_var.get().strip()
+                if not local_path or not os.path.isfile(local_path):
+                    self.log("请选择有效的本地 .gjf 文件")
+                    return
+                remote_filename = os.path.basename(local_path)
+                remote_file_path = posixpath.join(workdir, remote_filename)
                 try:
-                    self.sftp.stat(target_path)
-                    if not tk.messagebox.askyesno("文件已存在", f"目标文件 {target_path} 已存在，是否覆盖？"):
+                    self.sftp.stat(remote_file_path)
+                    if not tk.messagebox.askyesno("文件已存在", f"远程文件 {remote_file_path} 已存在，是否覆盖？"):
                         self.log("操作取消")
                         return
                 except FileNotFoundError:
                     pass
-                self.log(f"复制远程文件 {remote_path} -> {target_path}")
+                self.log(f"上传文件 {local_path} -> {remote_file_path}")
                 try:
-                    with self.sftp.open(remote_path, 'rb') as src:
-                        with self.sftp.open(target_path, 'wb') as dst:
-                            dst.write(src.read())
-                    remote_file_path = target_path
+                    self.sftp.put(local_path, remote_file_path)
                 except Exception as e:
-                    self.log(f"复制远程文件失败: {e}")
+                    self.log(f"上传失败: {e}")
                     return
-            else:
-                remote_file_path = remote_path
+            else:  # remote
+                remote_url = self.reorg_remote_file_var.get().strip()
+                if not remote_url:
+                    self.log("请选择远程 .gjf 文件")
+                    return
+                if remote_url.startswith("ssh://"):
+                    parsed = urllib.parse.urlparse(remote_url)
+                    remote_path = parsed.path
+                else:
+                    remote_path = remote_url
+                try:
+                    self.sftp.stat(remote_path)
+                except FileNotFoundError:
+                    self.log(f"远程文件不存在: {remote_path}")
+                    return
+                except Exception as e:
+                    self.log(f"检查远程文件失败: {e}")
+                    return
+                remote_filename = os.path.basename(remote_path)
+                if posixpath.dirname(remote_path) != workdir:
+                    target_path = posixpath.join(workdir, remote_filename)
+                    try:
+                        self.sftp.stat(target_path)
+                        if not tk.messagebox.askyesno("文件已存在", f"目标文件 {target_path} 已存在，是否覆盖？"):
+                            self.log("操作取消")
+                            return
+                    except FileNotFoundError:
+                        pass
+                    self.log(f"复制远程文件 {remote_path} -> {target_path}")
+                    try:
+                        with self.sftp.open(remote_path, 'rb') as src:
+                            with self.sftp.open(target_path, 'wb') as dst:
+                                dst.write(src.read())
+                    except Exception as e:
+                        self.log(f"复制远程文件失败: {e}")
+                        return
+                else:
+                    remote_path = remote_path  # 已在工作目录
+            remote_file_arg = remote_filename
 
-        # 构建命令
+        # ---------- 构建命令 ----------
         g_val = self.reorg_params['g'].get().strip() or "b3lyp"
         o_val = self.reorg_params['o'].get().strip() or g_val
         gb_val = self.reorg_params['gb'].get().strip() or "6-31G(d,p)"
@@ -3334,16 +3490,63 @@ class GaussianToolGUI(TkinterDnD.Tk):
         sm_val = self.reorg_params['sm'].get().strip() or "1"
         c_val = self.reorg_params['c'].get().strip() or "0"
 
-        cmd = (f"nomap.sh {remote_filename} "
-               f"g='{g_val}' o='{o_val}'"
-               f"gb='{gb_val}' ob='{ob_val}'"
-               f"root={root_val}"
-               f"sm={sm_val} c={c_val}")
+        cmd_parts = [
+            f"g='{g_val}'",
+            f"o='{o_val}'",
+            f"gb='{gb_val}'",
+            f"ob='{ob_val}'",
+            f"root={root_val}",
+            f"sm={sm_val}",
+            f"c={c_val}"
+        ]
+
+        # 处理 state1
+        if self.reorg_skip_step1.get():
+            state1_path = self.reorg_state1_var.get().strip()
+            if not state1_path:
+                self.log("勾选了跳过基态频率，但未提供 state1.fchk 路径")
+                return
+            if state1_path.startswith("ssh://"):
+                parsed = urllib.parse.urlparse(state1_path)
+                state1_remote = parsed.path
+            else:
+                state1_remote = state1_path
+            try:
+                self.sftp.stat(state1_remote)
+            except FileNotFoundError:
+                self.log(f"远程 state1 文件不存在: {state1_remote}")
+                return
+            cmd_parts.append(f"state1={state1_remote}")
+
+        # 处理 state2
+        if self.reorg_skip_step3.get():
+            state2_path = self.reorg_state2_var.get().strip()
+            if not state2_path:
+                self.log("勾选了跳过激发态频率，但未提供 state2.fchk 路径")
+                return
+            if state2_path.startswith("ssh://"):
+                parsed = urllib.parse.urlparse(state2_path)
+                state2_remote = parsed.path
+            else:
+                state2_remote = state2_path
+            try:
+                self.sftp.stat(state2_remote)
+            except FileNotFoundError:
+                self.log(f"远程 state2 文件不存在: {state2_remote}")
+                return
+            cmd_parts.append(f"state2={state2_remote}")
+
+        # 处理 IC 禁用
+        if not self.reorg_ic_enabled.get():
+            cmd_parts.append("ic=off")
+
+        # 组装完整命令
+        cmd = f"nomap.sh {remote_file_arg} " + " ".join(cmd_parts)
         full_cmd = f"cd {workdir} && {cmd}"
 
         self.log(f"准备执行远程命令: {full_cmd}")
 
-        # 后台执行
+        # ---------- 后台执行 ----------
         def run_remote_command():
             try:
                 stdin, stdout, stderr = self.ssh_client.exec_command(full_cmd)
@@ -3365,6 +3568,268 @@ class GaussianToolGUI(TkinterDnD.Tk):
 
         threading.Thread(target=run_remote_command, daemon=True).start()
         self.log("任务已提交到后台，输出将实时显示。")
+
+    # ---------- 提取 SOC 数据模式 ----------
+    def create_extract_soc_widgets(self):
+        row = 0
+
+        self.soc_folder_var = tk.StringVar()
+        ttk.Label(self.param_frame, text="选择包含 ORCA 输出文件的文件夹:").grid(row=row, column=0, sticky=tk.W, padx=5,
+                                                                                 pady=2)
+        entry = ttk.Entry(self.param_frame, textvariable=self.soc_folder_var, width=50)
+        entry.grid(row=row, column=1, padx=5, pady=2)
+        ttk.Button(self.param_frame, text="浏览", command=lambda: self.select_folder(self.soc_folder_var)).grid(row=row,
+                                                                                                                column=2,
+                                                                                                                padx=5,
+                                                                                                                pady=2)
+        ttk.Button(self.param_frame, text="远程", command=lambda: self.select_remote_folder(self.soc_folder_var)).grid(
+            row=row, column=3, padx=5, pady=2)
+        self.current_widgets.extend([entry])
+        row += 1
+
+        btn_frame = ttk.Frame(self.param_frame)
+        btn_frame.grid(row=row, column=0, columnspan=3, pady=5)
+        ttk.Button(btn_frame, text="批量解析 SOC", command=self.start_batch_soc).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="导出 CSV（合并）", command=self.export_soc_csv).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="导出 Excel（多sheet）", command=self.export_soc_excel).pack(side=tk.LEFT, padx=5)
+        self.current_widgets.append(btn_frame)
+        row += 1
+
+        # Notebook 用于显示各文件的 SOC 矩阵
+        self.soc_notebook = ttk.Notebook(self.param_frame)
+        self.soc_notebook.grid(row=row, column=0, columnspan=3, sticky="nsew", pady=5)
+        self.param_frame.grid_rowconfigure(row, weight=1)
+        self.param_frame.grid_columnconfigure(1, weight=1)
+        self.current_widgets.append(self.soc_notebook)
+
+        # 存储所有文件的 SOC 数据（用于导出）
+        self.batch_soc_data = []  # 每个元素: {'filename': , 'df': DataFrame}
+
+    def start_batch_soc(self):
+        folder = self.soc_folder_var.get().strip()
+        temp_input = None
+        try:
+            if folder.startswith("ssh://"):
+                self.log("检测到远程输入路径，正在下载...")
+                temp_input = self.download_remote_path(folder, suffix_filter=['.out', '.log'])
+                if not temp_input:
+                    self.log("下载远程文件夹失败")
+                    return
+                folder = temp_input
+                self.log(f"已下载到本地临时目录: {folder}")
+
+            if not folder or not os.path.isdir(folder):
+                self.log("请选择有效的文件夹")
+                return
+
+            # 查找 .out 或 .log 文件
+            out_files = glob.glob(os.path.join(folder, "*.out")) + glob.glob(os.path.join(folder, "*.log"))
+            if not out_files:
+                self.log("未找到 .out 或 .log 文件")
+                return
+
+            self.log(f"开始解析 SOC 数据，共 {len(out_files)} 个文件...")
+            for tab in self.soc_notebook.tabs():
+                self.soc_notebook.forget(tab)
+            self.batch_soc_data.clear()
+
+            for filepath in out_files:
+                try:
+                    self.log(f"正在解析: {os.path.basename(filepath)}")
+                    data = parse_soc_ms_matrix(filepath)
+                    if not data:
+                        self.log(f"警告: {os.path.basename(filepath)} 未发现 SOC 数据")
+                        continue
+                    df = build_dataframe(data, os.path.basename(filepath))
+                    self.batch_soc_data.append({
+                        'filename': os.path.basename(filepath),
+                        'df': df
+                    })
+                    self.after(0, self._add_soc_tab, os.path.basename(filepath), df)
+                except Exception as e:
+                    self.log(f"解析 {filepath} 失败: {e}")
+
+            self.log("SOC 批量解析完成")
+        finally:
+            if temp_input:
+                self.cleanup_temp_dir(temp_input)
+
+    def _add_soc_tab(self, filename, df):
+        tab_frame = ttk.Frame(self.soc_notebook)
+        self.soc_notebook.add(tab_frame, text=filename.replace('.out', '').replace('.log', ''))
+
+        # ---- 树形表格 ----
+        tree_frame = ttk.Frame(tab_frame)
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+        scroll_y = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL)
+        scroll_x = ttk.Scrollbar(tree_frame, orient=tk.HORIZONTAL)
+
+        columns = [''] + list(df.columns)
+        tree = ttk.Treeview(tree_frame, columns=columns, show='headings',
+                            yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set,
+                            selectmode='extended')
+        scroll_y.config(command=tree.yview)
+        scroll_x.config(command=tree.xview)
+
+        # 设置列标题
+        tree.heading('', text='')
+        tree.column('', width=60, anchor='center')
+        for col in columns[1:]:
+            tree.heading(col, text=col)
+            tree.column(col, width=70, anchor='center')
+
+        # 插入数据
+        for idx, row_name in enumerate(df.index):
+            values = [row_name] + [f"{val:.6f}" for val in df.iloc[idx].values]
+            tree.insert('', tk.END, values=values)
+
+        # 布局
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+        scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # ---- 信息栏 ----
+        info_frame = ttk.Frame(tab_frame)
+        info_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        # 最大值信息
+        if not df.empty:
+            max_val = df.values.max()
+            max_pos = df.stack().idxmax()
+            ttk.Label(info_frame, text=f"最大值: {max_val:.6f} (位置 {max_pos[0]}, {max_pos[1]})").pack(side=tk.LEFT,
+                                                                                                        padx=10)
+
+        # 当前选中单元格信息
+        self.soc_cell_label = ttk.Label(info_frame, text="点击单元格查看数值", foreground="blue")
+        self.soc_cell_label.pack(side=tk.LEFT, padx=10)
+
+        # ---- 交互绑定 ----
+        # 单击：显示单元格信息
+        def on_tree_click(event):
+            row_id = tree.identify_row(event.y)
+            col_id = tree.identify_column(event.x)
+            if not row_id or not col_id:
+                return
+            item = tree.item(row_id)
+            values = item['values']
+            col_index = int(col_id[1:]) - 1  # col_id '#0' -> 0, '#1' -> 1, ...
+            if col_index == 0:
+                # 点击行号列
+                row_name = values[0]
+                self.soc_cell_label.config(text=f"选中行: {row_name}")
+            else:
+                # 点击数据单元格
+                col_name = df.columns[col_index - 1] if col_index <= len(df.columns) else ""
+                row_name = values[0]
+                cell_value = values[col_index] if col_index < len(values) else ""
+                self.soc_cell_label.config(text=f"双击复制该数据: {row_name}, {col_name} = {cell_value}")
+
+        tree.bind("<Button-1>", on_tree_click)
+
+        # 双击：复制数值
+        def on_double_click(event):
+            row_id = tree.identify_row(event.y)
+            col_id = tree.identify_column(event.x)
+            if row_id and col_id:
+                item = tree.item(row_id)
+                values = item['values']
+                col_index = int(col_id[1:]) - 1
+                if col_index == 0:
+                    copy_text = values[0]
+                else:
+                    copy_text = values[col_index] if col_index < len(values) else ""
+                if copy_text:
+                    self.clipboard_clear()
+                    self.clipboard_append(copy_text)
+                    self.log(f"已复制: {copy_text}")
+
+        tree.bind("<Double-1>", on_double_click)
+
+        # 右键菜单
+        def show_context_menu(event):
+            menu = tk.Menu(tab_frame, tearoff=0)
+            row_id = tree.identify_row(event.y)
+            col_id = tree.identify_column(event.x)
+            if row_id and col_id:
+                item = tree.item(row_id)
+                values = item['values']
+                col_index = int(col_id[1:]) - 1
+                if col_index == 0:
+                    copy_text = values[0]
+                else:
+                    copy_text = values[col_index] if col_index < len(values) else ""
+                if copy_text:
+                    menu.add_command(label="复制数值",
+                                     command=lambda t=copy_text: (self.clipboard_clear(), self.clipboard_append(t)))
+            # 复制行
+            menu.add_command(label="复制行", command=lambda r=row_id: self._copy_soc_row(tree, r))
+            # 复制矩阵
+            menu.add_command(label="复制矩阵", command=lambda: self._copy_soc_matrix(tree))
+            menu.post(event.x_root, event.y_root)
+
+        tree.bind("<Button-3>", show_context_menu)
+
+        # 列标题点击：选中整列
+        def on_column_click(col_name):
+            # 选中所有行
+            for child in tree.get_children():
+                tree.selection_add(child)
+            self.soc_cell_label.config(text=f"选中列: {col_name}")
+            # 可选：将列数据复制到剪贴板？不自动复制，用户可右键复制矩阵
+
+        for col in columns[1:]:
+            tree.heading(col, command=lambda c=col: on_column_click(c))
+
+    def export_soc_csv(self):
+        if not self.batch_soc_data:
+            self.log("没有数据可导出，请先执行批量解析")
+            return
+        save_path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv")])
+        if not save_path:
+            return
+        try:
+            all_rows = []
+            for item in self.batch_soc_data:
+                df = item['df']
+                for idx, row in df.iterrows():
+                    for col in df.columns:
+                        all_rows.append([item['filename'], idx, col, row[col]])
+            import csv
+            with open(save_path, 'w', encoding='utf-8-sig', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(["文件", "T态", "S态", "总SOC (cm⁻¹)"])
+                writer.writerows(all_rows)
+            self.log(f"CSV 已保存至: {save_path}")
+        except Exception as e:
+            self.log(f"导出失败: {e}")
+
+    def export_soc_excel(self):
+        if not self.batch_soc_data:
+            self.log("没有数据可导出，请先执行批量解析")
+            return
+        save_path = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel files", "*.xlsx")])
+        if not save_path:
+            return
+        try:
+            from openpyxl import Workbook
+            wb = Workbook()
+            default_sheet = wb.active
+            wb.remove(default_sheet)
+            for item in self.batch_soc_data:
+                filename = item['filename']
+                sheet_name = filename.replace('.out', '').replace('.log', '')[:31]
+                for ch in '[]:*?/\\':
+                    sheet_name = sheet_name.replace(ch, '_')
+                ws = wb.create_sheet(title=sheet_name)
+                headers = [''] + list(item['df'].columns)
+                ws.append(headers)
+                df = item['df']
+                for idx, row in df.iterrows():
+                    ws.append([idx] + list(row.values))
+            wb.save(save_path)
+            self.log(f"Excel 已保存至: {save_path}")
+        except Exception as e:
+            self.log(f"导出失败: {e}")
 
 
 class FTPWindow(tk.Toplevel):
